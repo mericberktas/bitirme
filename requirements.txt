@@ -1,0 +1,10 @@
+# Lower bounds only. After the first successful Colab run, take the exact versions
+# from <run_dir>/env.json ("packages") and pin them here.
+numpy
+pyyaml
+torch
+transformers>=4.51
+sentence-transformers>=3.0
+datasets
+tensorboard
+pytest

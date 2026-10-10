@@ -1,0 +1,63 @@
+# Baseline: single-teacher distillation from Qwen3-Embedding-8B on the -1k student.
+# This is our own re-implementation of the recipe behind ytu-ce-cosmos/modernbert-tr-embed,
+# so that the multi-teacher runs can be compared under the same student, data and budget.
+#
+# Paths below assume Google Drive is mounted at /content/drive (Colab).
+
+name: single_qwen3_8b
+output_dir: /content/drive/MyDrive/bitirme/runs
+local_tmp_dir: /content/ckpt_staging   # fast local disk; checkpoints are then moved to Drive
+tensorboard: true
+
+teachers:
+  # Dimensions / prefixes below come from the model cards and must be verified once
+  # (encode_teachers fails with a shape error if `dim` is wrong).
+  - name: qwen3_8b
+    hf_id: Qwen/Qwen3-Embedding-8B
+    dim: 4096
+    doc_prefix: ""
+    max_length: 512
+    batch_size: 32
+    dtype: bfloat16
+
+student:
+  hf_id: ytu-ce-cosmos/modernbert-tr-base-1k
+  max_length: 512
+  pooling: mean
+
+data:
+  corpus_path: /content/drive/MyDrive/bitirme/data/corpus.jsonl
+  text_column: text
+  cache_dir: /content/drive/MyDrive/bitirme/cache/teachers
+  shard_size: 100000
+  max_samples: 1000000
+  min_chars: 20
+  val_size: 2000
+
+loss:
+  cosine_weight: 10.0
+  sim_weight: 200.0
+  resim_weight: 20.0
+  resim_margin: 0.015
+  resim_num_samples: 4096
+  gor_weight: 0.0
+
+train:
+  batch_size: 128
+  lr: 5.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_steps: 10000
+  grad_clip: 1.0
+  bf16: true
+  seed: 42
+  num_workers: 2
+  log_every: 50
+  diag_every: 500
+  ckpt_every: 1000
+  keep_last: 2
+
+eval:
+  sts_dataset: null    # e.g. a Turkish STS-B dataset id; set sts_columns if its columns differ
+  sts_split: validation
+  sts_columns: null

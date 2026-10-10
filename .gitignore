@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Experiment artefacts (these live on Google Drive, never in git)
+runs/
+cache/
+data/
+*.pt
+*.npy
+*.safetensors
+
+# LaTeX build files
+*.aux
+*.log
+*.bbl
+*.bcf
+*.blg
+*.run.xml
+*.toc
+*.lof
+*.lot
+*.out
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+_minted*/
+rapor/main.pdf
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local Claude Code settings
+.claude/settings.local.json
