@@ -107,3 +107,37 @@ def test_epoch_batches_deterministic_and_resumable():
     assert epoch_batches(idx, 8, seed=5, epoch=3) != full
     flat = [i for b in full for i in b]
     assert len(set(flat)) == len(flat)  # no repeats within an epoch
+
+
+def test_resuming_with_a_different_shard_size_is_refused(tmp_path):
+    texts = make_texts(90)
+    teacher = TeacherConfig("t", "fake/t", 4)
+    # Interrupted run: shard 0 exists (40 rows), no meta.json yet.
+    encode_teacher(teacher, texts[:40], tmp_path, 40, encode_fn=fake_encode_fn(4, 0), fingerprint="fp", verbose=False)
+    directory = tmp_path / "t" / "fp"
+    (directory / "meta.json").unlink()
+    with pytest.raises(ValueError, match="different shard_size"):
+        encode_teacher(teacher, texts, tmp_path, 25, encode_fn=fake_encode_fn(4, 0), fingerprint="fp", verbose=False)
+
+
+def test_finished_cache_with_other_shard_size_is_refused_via_meta(tmp_path):
+    texts = make_texts(60)
+    teacher = TeacherConfig("t", "fake/t", 4)
+    encode_teacher(teacher, texts, tmp_path, 30, encode_fn=fake_encode_fn(4, 0), fingerprint="fp", verbose=False)
+    with pytest.raises(ValueError, match="built with shard_size=30"):
+        encode_teacher(teacher, texts, tmp_path, 20, encode_fn=fake_encode_fn(4, 0), fingerprint="fp", verbose=False)
+
+
+def test_damaged_shard_is_not_silently_accepted(tmp_path):
+    texts = make_texts(50)
+    teacher = TeacherConfig("t", "fake/t", 4)
+    path = encode_teacher(teacher, texts, tmp_path, 25, encode_fn=fake_encode_fn(4, 0), fingerprint="fp", verbose=False)
+    (path / "meta.json").unlink()
+    (path / "shard_00001.npy").write_bytes(b"garbage")
+    with pytest.raises(ValueError, match="unreadable"):
+        encode_teacher(teacher, texts, tmp_path, 25, encode_fn=fake_encode_fn(4, 0), fingerprint="fp", verbose=False)
+
+
+def test_default_shard_size_keeps_the_work_lost_per_interruption_small():
+    from turkish_distill.config import DataConfig
+    assert DataConfig().shard_size == 10_000

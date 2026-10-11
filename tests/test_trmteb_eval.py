@@ -118,3 +118,68 @@ def test_run_explains_how_to_install_mteb_tr(monkeypatch):
 def test_prompt_escape_handling():
     assert trmteb._unescape("Instruct: a\\nQuery: ") == "Instruct: a\nQuery: "
     assert trmteb._unescape(None) is None
+
+
+# --- reuse of prompt-insensitive results ---------------------------------------------------
+
+PLAIN_INFO = {"model": "x/y", "revision": "abc", "dtype": "float16", "max_seq_length": 512, "prompts": {}}
+
+
+def make_plain_run(root, label="plain", info=None, skip=()):
+    run = root / label
+    write_all_except(run / "inner" / "rev", skip)
+    (run / "run_info.json").write_text(json.dumps(info or PLAIN_INFO), encoding="utf-8")
+    return run
+
+
+def write_all_except(directory, skip=()):
+    for task in TASK_CATEGORIES:
+        if task not in skip:
+            write_result(directory, task, 0.5)
+
+
+def test_prepare_reuse_copies_only_non_retrieval_tasks(tmp_path):
+    make_plain_run(tmp_path)
+    label_dir = tmp_path / "prompted"
+    protocol = {k: PLAIN_INFO[k] for k in ("model", "revision", "dtype", "max_seq_length")}
+    reused, remaining = trmteb.prepare_reuse(tmp_path, label_dir, "plain", protocol)
+    assert len(reused) == 15 and len(remaining) == 11
+    assert all(TASK_CATEGORIES[t] != "Retrieval" for t in reused)
+    assert all(TASK_CATEGORIES[t] == "Retrieval" for t in remaining)
+    assert sorted(p.stem for p in (label_dir / "reused").glob("*.json")) == sorted(reused)
+    # the reused files are picked up by the summary together with newly evaluated tasks
+    for task in remaining:
+        write_result(label_dir / "inner" / "rev", task, 0.7)
+    s = summarize_dir(label_dir)
+    assert s["complete"] and s["num_tasks"] == 26
+    assert s["categories"]["Retrieval"] == pytest.approx(70.0) and s["categories"]["STS"] == pytest.approx(50.0)
+
+
+def test_prepare_reuse_respects_task_subset_and_missing_source_tasks(tmp_path):
+    make_plain_run(tmp_path, skip=("STSbTR",))
+    protocol = {k: PLAIN_INFO[k] for k in ("model", "revision", "dtype", "max_seq_length")}
+    reused, remaining = trmteb.prepare_reuse(
+        tmp_path, tmp_path / "p", "plain", protocol, task_names=["STSbTR", "MnliTr", "NFCorpusTR"]
+    )
+    assert reused == ["MnliTr"]
+    assert remaining == ["STSbTR", "NFCorpusTR"]  # missing in the source -> evaluated normally; retrieval -> evaluated
+
+
+def test_prepare_reuse_rejects_a_different_protocol_or_missing_or_prompted_source(tmp_path):
+    protocol = {k: PLAIN_INFO[k] for k in ("model", "revision", "dtype", "max_seq_length")}
+    with pytest.raises(FileNotFoundError, match="plain evaluation first"):
+        trmteb.prepare_reuse(tmp_path, tmp_path / "p", "nope", protocol)
+    make_plain_run(tmp_path, "other_dtype", info={**PLAIN_INFO, "dtype": "float32"})
+    with pytest.raises(ValueError, match="different protocol"):
+        trmteb.prepare_reuse(tmp_path, tmp_path / "p", "other_dtype", protocol)
+    make_plain_run(tmp_path, "other_model", info={**PLAIN_INFO, "model": "a/b"})
+    with pytest.raises(ValueError, match="different protocol"):
+        trmteb.prepare_reuse(tmp_path, tmp_path / "p", "other_model", protocol)
+    make_plain_run(tmp_path, "was_prompted", info={**PLAIN_INFO, "prompts": {"query": "q: "}})
+    with pytest.raises(ValueError, match="plain run"):
+        trmteb.prepare_reuse(tmp_path, tmp_path / "p", "was_prompted", protocol)
+
+
+def test_run_evaluation_requires_prompts_for_reuse():
+    with pytest.raises(ValueError, match="only makes sense"):
+        trmteb.run_evaluation("x/y", "out", reuse_from="plain")

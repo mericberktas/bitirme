@@ -48,7 +48,7 @@ class DataConfig:
     corpus_path: str = ""
     text_column: str = "text"
     cache_dir: str = ""
-    shard_size: int = 100_000
+    shard_size: int = 10_000
     max_samples: Optional[int] = None
     min_chars: int = 20
     val_size: int = 2000

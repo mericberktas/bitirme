@@ -101,15 +101,38 @@ def encode_teacher(
     directory.mkdir(parents=True, exist_ok=True)
     num_shards = math.ceil(len(texts) / shard_size)
 
+    # Shards are addressed by index, so resuming with a different shard_size would silently pair
+    # vectors with the wrong texts. Refuse to continue a cache built with another shard_size.
+    meta_path = directory / "meta.json"
+    if meta_path.exists():
+        previous = json.loads(meta_path.read_text(encoding="utf-8")).get("shard_size")
+        if previous is not None and previous != shard_size:
+            raise ValueError(
+                f"teacher {teacher.name}: {directory} was built with shard_size={previous}, "
+                f"now shard_size={shard_size}. Use the old value or delete that directory."
+            )
+
     close = lambda: None  # noqa: E731
     if encode_fn is None:
         encode_fn, close = make_sentence_transformer_encoder(teacher)
     try:
         for shard in range(num_shards):
             path = _shard_path(directory, shard)
-            if path.exists():
-                continue
             lo, hi = shard * shard_size, min((shard + 1) * shard_size, len(texts))
+            if path.exists():
+                # A shard written under another shard_size (a partial cache has no meta.json yet)
+                # or a damaged file must not be silently accepted.
+                try:
+                    shape = np.load(path, mmap_mode="r").shape
+                except Exception as exc:
+                    raise ValueError(f"teacher {teacher.name}: shard {shard} ({path}) is unreadable: {exc}") from exc
+                if shape != (hi - lo, teacher.dim):
+                    raise ValueError(
+                        f"teacher {teacher.name}: existing shard {shard} has shape {shape}, expected "
+                        f"{(hi - lo, teacher.dim)}. Was the cache built with a different shard_size? "
+                        f"Use the original value or delete {directory}."
+                    )
+                continue
             batch = [teacher.doc_prefix + t for t in texts[lo:hi]]
             vectors = _normalize(np.asarray(encode_fn(batch)))
             if vectors.shape != (hi - lo, teacher.dim):

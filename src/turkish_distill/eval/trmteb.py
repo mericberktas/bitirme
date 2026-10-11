@@ -32,6 +32,7 @@ import argparse
 import gc
 import json
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -197,6 +198,48 @@ def _unescape(text: Optional[str]) -> Optional[str]:
     return None if text is None else text.replace("\\n", "\n").replace("\\t", "\t")
 
 
+_PROTOCOL_KEYS = ("model", "revision", "dtype", "max_seq_length")
+
+
+def prepare_reuse(
+    output_dir: str | Path,
+    label_dir: str | Path,
+    reuse_from: str,
+    protocol: dict,
+    task_names: Optional[list[str]] = None,
+) -> tuple[list[str], list[str]]:
+    """Copy prompt-insensitive task results from an earlier plain run.
+
+    Returns (tasks reused, tasks that still have to be evaluated). Retrieval tasks are never
+    reused (queries and passages receive the prompts); a non-retrieval task missing from the
+    source run is simply evaluated normally.
+    """
+    src_dir = Path(output_dir) / reuse_from
+    info_path = src_dir / "run_info.json"
+    if not info_path.exists():
+        raise FileNotFoundError(f"reuse_from={reuse_from!r}: no run_info.json in {src_dir}; run the plain evaluation first")
+    src = json.loads(info_path.read_text(encoding="utf-8"))
+    if src.get("prompts"):
+        raise ValueError(f"reuse_from={reuse_from!r} used prompts itself; it must be a plain run")
+    mismatched = {k: (src.get(k), protocol.get(k)) for k in _PROTOCOL_KEYS if src.get(k) != protocol.get(k)}
+    if mismatched:
+        raise ValueError(f"reuse_from={reuse_from!r} was run with a different protocol (source, requested): {mismatched}")
+
+    wanted = list(task_names) if task_names else list(TASK_CATEGORIES)
+    source_scores = collect_task_scores(src_dir)
+    reuse_dir = Path(label_dir) / "reused"
+    reused: list[str] = []
+    remaining: list[str] = []
+    for task in wanted:
+        if TASK_CATEGORIES[task] != "Retrieval" and task in source_scores:
+            reuse_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_scores[task]["file"], reuse_dir / f"{task}.json")
+            reused.append(task)
+        else:
+            remaining.append(task)
+    return reused, remaining
+
+
 def run_evaluation(
     model: str,
     output_dir: str | Path,
@@ -211,10 +254,15 @@ def run_evaluation(
     trust_remote_code: bool = False,
     overwrite: bool = False,
     verbosity: int = 1,
+    reuse_from: Optional[str] = None,
 ) -> Path:
     """Evaluate one model on TR-MTEB. Returns the label directory holding the results.
 
     `model` is a Hugging Face id or a local path (e.g. a trained student's `final/` directory).
+
+    `reuse_from` (only with prompts): label of an earlier plain run of the SAME model/revision/
+    dtype/max_seq_length in `output_dir`. Prompts change retrieval scores only, so the results of
+    all non-retrieval tasks are copied from that run and only retrieval is evaluated.
     """
     if task_names:
         unknown = sorted(set(task_names) - set(TASK_CATEGORIES))
@@ -223,6 +271,9 @@ def run_evaluation(
     dtypes = ("float32", "float16", "bfloat16")
     if dtype not in dtypes:
         raise ValueError(f"dtype must be one of {dtypes}, got {dtype!r}")
+    prompted = query_prompt is not None or passage_prompt is not None
+    if reuse_from and not prompted:
+        raise ValueError("reuse_from only makes sense for a run with prompts (query_prompt/passage_prompt)")
 
     try:
         import mteb
@@ -240,21 +291,10 @@ def run_evaluation(
     import torch
     from sentence_transformers import SentenceTransformer
 
-    prompted = query_prompt is not None or passage_prompt is not None
     label = label or sanitize_label(model, revision, "prompted" if prompted else "")
     label_dir = Path(output_dir) / label
     label_dir.mkdir(parents=True, exist_ok=True)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    st_model = SentenceTransformer(
-        model,
-        revision=revision,
-        device=device,
-        trust_remote_code=trust_remote_code,
-        model_kwargs={"torch_dtype": getattr(torch, dtype)},
-    )
-    if max_seq_length:
-        st_model.max_seq_length = max_seq_length
     # Explicit prompts only: the model's built-in prompt table is ignored so that every
     # model is evaluated under the same, recorded protocol.
     prompts: dict[str, str] = {}
@@ -262,10 +302,16 @@ def run_evaluation(
         prompts["query"] = query_prompt
     if passage_prompt is not None:
         prompts["passage"] = passage_prompt
-    st_model.prompts = prompts
-    st_model.default_prompt_name = None
 
-    tasks = mteb.get_tasks(tasks=task_names, languages=["tur"]) if task_names else benchmark
+    # Prompts only reach retrieval tasks (queries vs passages), so the other tasks score exactly
+    # the same as in a plain run of the same model: reuse them instead of recomputing.
+    tasks_to_run: Optional[list[str]] = list(task_names) if task_names else None
+    reused: list[str] = []
+    if reuse_from:
+        protocol = {"model": model, "revision": revision, "dtype": dtype, "max_seq_length": max_seq_length}
+        reused, tasks_to_run = prepare_reuse(output_dir, label_dir, reuse_from, protocol, task_names)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     info = {
         "model": model,
         "revision": revision,
@@ -276,23 +322,39 @@ def run_evaluation(
         "max_seq_length": max_seq_length,
         "batch_size": batch_size,
         "device": device,
+        "reused_from": reuse_from,
+        "reused_tasks": reused,
         "mteb_version": getattr(mteb, "__version__", None),
         "started": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     (label_dir / "run_info.json").write_text(json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
-    try:
-        MTEB(tasks=tasks).run(
-            st_model,
-            output_folder=str(label_dir),
-            encode_kwargs={"batch_size": batch_size},
-            overwrite_results=overwrite,
-            verbosity=verbosity,
+
+    if tasks_to_run is None or tasks_to_run:  # an empty list means everything was reused
+        st_model = SentenceTransformer(
+            model,
+            revision=revision,
+            device=device,
+            trust_remote_code=trust_remote_code,
+            model_kwargs={"torch_dtype": getattr(torch, dtype)},
         )
-    finally:
-        del st_model
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if max_seq_length:
+            st_model.max_seq_length = max_seq_length
+        st_model.prompts = prompts
+        st_model.default_prompt_name = None
+        tasks = mteb.get_tasks(tasks=tasks_to_run, languages=["tur"]) if tasks_to_run else benchmark
+        try:
+            MTEB(tasks=tasks).run(
+                st_model,
+                output_folder=str(label_dir),
+                encode_kwargs={"batch_size": batch_size},
+                overwrite_results=overwrite,
+                verbosity=verbosity,
+            )
+        finally:
+            del st_model
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     summary = summarize_dir(label_dir)
     summary["protocol"] = info
@@ -318,6 +380,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
         batch_size=args.batch_size,
         trust_remote_code=args.trust_remote_code,
         overwrite=args.overwrite,
+        reuse_from=args.reuse_from,
     )
     print(format_table({label_dir.name: summarize_dir(label_dir)}))
     print(f"results: {label_dir}")
@@ -348,6 +411,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--batch-size", type=int, default=32)
     run.add_argument("--trust-remote-code", action="store_true")
     run.add_argument("--overwrite", action="store_true", help="recompute tasks that already have results")
+    run.add_argument(
+        "--reuse-from",
+        default=None,
+        help="label of an earlier PLAIN run of the same model: copy its non-retrieval results, evaluate only retrieval "
+        "(requires --query-prompt/--passage-prompt)",
+    )
     run.set_defaults(func=_cmd_run)
 
     summ = sub.add_parser("summarize", help="compare finished result folders")
