@@ -14,6 +14,8 @@ Tek git reposu: kod, rapor (LaTeX) ve araştırma notları birlikte tutulur. Uza
 - `src/turkish_distill/` — Python paketi: `config`, `losses`, `models`, `teachers` (shard cache), `data`, `train`, `encode_teachers`, `prepare_corpus`, `checkpoint`, `logging_utils`, `diagnostics`, `eval/sts`, `utils`.
 - `configs/` — YAML deney tanımları (`single_teacher_qwen3_8b.yaml`, `multi_teacher_a.yaml`).
 - `notebooks/colab_pipeline.ipynb` — ince Colab notebook'u (Drive bağla, repoyu klonla, `pip install -e .`, corpus → öğretmen cache → eğitim → TensorBoard).
+- `notebooks/colab_eval.ipynb` — yalnızca değerlendirme: model preset'leri (sabit revision'larla), TR-MTEB koşusu, sonuçların karşılaştırılması. Eğitimden ayrı runtime'da çalıştırılır (GPU çakışması; `mteb_tr` `datasets<3` sabitler).
+- `src/turkish_distill/eval/trmteb.py` — parametrik TR-MTEB değerlendirmesi (`mteb_tr` çatalı, `MTEB(Turkish)`, 26 görev). Varsayılan protokol talimatsız/önneksiz (TR-MTEB yazarlarının yöntemi); Mean(task) ve Mean(type), bitext dahil/hariç. Sonuçlar `bitirme/eval/<label>/`.
 - `tests/` — CPU'da çalışan testler (`pytest`); küçük sahte backbone ve sahte öğretmenlerle. Gerçek model/GPU ile henüz denenmedi.
 - `README.md`, `pyproject.toml`, `requirements.txt`, `.gitignore`.
 - `arastirma/ogretmen_veri_benchmark_arastirmasi.md` — öğretmen adayları, veri setleri, benchmark'lar, damıtma literatürü ve skor tabloları (kaynaklı, belirsiz yerler işaretli).

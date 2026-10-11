@@ -9,7 +9,7 @@ The student is `ytu-ce-cosmos/modernbert-tr-base-1k`. Several teacher embedding 
 ```
 src/turkish_distill/   Python package (config, losses, models, teachers cache, training, eval)
 configs/               YAML experiment definitions
-notebooks/             Thin Colab notebook(s) that call the package
+notebooks/             Thin Colab notebooks: colab_pipeline (distillation), colab_eval (TR-MTEB)
 tests/                 CPU-only unit and smoke tests (no GPU, no model downloads)
 rapor/                 LaTeX project report
 arastirma/             Literature / teacher / dataset / benchmark research notes
@@ -29,6 +29,17 @@ python -m turkish_distill.train --config configs/multi_teacher_a.yaml
 ```
 
 On Colab use `notebooks/colab_pipeline.ipynb`: it mounts Drive, clones this repo, installs the package and runs the three steps. Everything it produces (cache, checkpoints, logs) lives on Google Drive.
+
+## Evaluation (TR-MTEB)
+
+`turkish_distill.eval.trmteb` evaluates any model (a Hugging Face id or a local path such as a trained student's `final/` folder) on the 26 tasks of `MTEB(Turkish)`, using the authors' MTEB fork (`pip install "git+https://github.com/selmanbaysan/mteb_tr.git"`, which pins `datasets<3`, so use it in a separate runtime). It resumes per task, writes one folder per model, and reports Mean(task), Mean(type), per-category scores, with and without bitext mining.
+
+```bash
+python -m turkish_distill.eval.trmteb run --model BAAI/bge-m3 --revision <hash> --output-dir <drive>/eval --dtype float16
+python -m turkish_distill.eval.trmteb summarize <drive>/eval/*
+```
+
+Default protocol: no instruction/prefix (as in the TR-MTEB authors' scripts); `--query-prompt` / `--passage-prompt` add prefixes explicitly. The Colab notebook for this is `notebooks/colab_eval.ipynb`.
 
 ## Losses
 
@@ -69,6 +80,6 @@ The tests use a tiny backbone and fake teachers. They verify the code paths (los
 ## Known limitations
 
 - Not yet run against the real models on a GPU. Teacher dimensions, prefixes and library versions in `configs/` come from model cards and must be verified on the first Colab run.
-- No benchmark evaluation yet (TR-MTEB wrapper is not implemented); only the optional fast STS monitor.
+- The TR-MTEB wrapper has only been tested on synthetic result files (summaries, CLI, error handling). It has not yet been run against the real `mteb_tr` fork on Colab: install compatibility with the current `transformers`/`sentence-transformers` is unverified.
 - Corpus preparation does not decontaminate against benchmark test sets.
 - No gradient accumulation: the similarity losses are defined on the full in-batch matrix.
