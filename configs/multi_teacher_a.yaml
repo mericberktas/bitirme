@@ -10,6 +10,7 @@ tensorboard: true
 teachers:
   - name: qwen3_8b
     hf_id: Qwen/Qwen3-Embedding-8B
+    revision: 1d8ad4ca9b3dd8059ad90a75d4983776a23d44af
     dim: 4096
     doc_prefix: ""
     max_length: 512
@@ -18,6 +19,7 @@ teachers:
     weight: 1.0
   - name: bge_m3
     hf_id: BAAI/bge-m3
+    revision: 5617a9f61b028005a4858fdac845db406aefb181
     dim: 1024
     doc_prefix: ""
     max_length: 512
@@ -26,6 +28,7 @@ teachers:
     weight: 1.0
   - name: me5_large_instruct
     hf_id: intfloat/multilingual-e5-large-instruct
+    revision: 274baa43b0e13e37fafa6428dbc7938e62e5c439
     dim: 1024
     doc_prefix: ""          # documents take no instruction (queries do); see model card
     max_length: 512
@@ -35,6 +38,7 @@ teachers:
 
 student:
   hf_id: ytu-ce-cosmos/modernbert-tr-base-1k
+  revision: c2e35f553101cce5b03fbb318ef8728473fd34dd
   max_length: 512
   pooling: mean
 

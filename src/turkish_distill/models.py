@@ -40,7 +40,7 @@ class StudentEncoder(nn.Module):
     def from_pretrained(cls, student: StudentConfig, teachers: list[TeacherConfig]) -> "StudentEncoder":
         from transformers import AutoModel
 
-        backbone = AutoModel.from_pretrained(student.hf_id)
+        backbone = AutoModel.from_pretrained(student.hf_id, revision=student.revision)
         hidden = backbone.config.hidden_size
         return cls(backbone, hidden, {t.name: t.dim for t in teachers}, student.pooling)
 

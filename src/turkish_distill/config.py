@@ -27,6 +27,10 @@ class TeacherConfig:
     batch_size: int = 32
     dtype: str = "bfloat16"
     trust_remote_code: bool = False
+    # Hugging Face commit hash of the model. Pinning it makes the teacher
+    # vectors reproducible; it is stored in the cache's meta.json and checked
+    # when the cache is opened.
+    revision: Optional[str] = None
     # Relative weight of this teacher in the total loss.
     weight: float = 1.0
 
@@ -36,6 +40,7 @@ class StudentConfig:
     hf_id: str = "ytu-ce-cosmos/modernbert-tr-base-1k"
     max_length: int = 512
     pooling: str = "mean"
+    revision: Optional[str] = None  # HF commit hash of the student backbone/tokenizer
 
 
 @dataclass

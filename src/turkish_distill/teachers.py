@@ -63,6 +63,7 @@ def make_sentence_transformer_encoder(teacher: TeacherConfig) -> tuple[EncodeFn,
         teacher.hf_id,
         device=device,
         trust_remote_code=teacher.trust_remote_code,
+        revision=teacher.revision,
         model_kwargs={"torch_dtype": dtypes[teacher.dtype]},
     )
     model.max_seq_length = teacher.max_length
@@ -128,6 +129,7 @@ def encode_teacher(
     meta = {
         "teacher": teacher.name,
         "hf_id": teacher.hf_id,
+        "revision": teacher.revision,
         "dim": teacher.dim,
         "doc_prefix": teacher.doc_prefix,
         "max_length": teacher.max_length,
@@ -175,6 +177,11 @@ class TeacherCache:
         if cache.meta.get("hf_id") != teacher.hf_id:
             raise ValueError(
                 f"teacher {teacher.name}: cache was built with {cache.meta.get('hf_id')}, config says {teacher.hf_id}"
+            )
+        if teacher.revision is not None and cache.meta.get("revision") != teacher.revision:
+            raise ValueError(
+                f"teacher {teacher.name}: cache was built from revision {cache.meta.get('revision')}, "
+                f"config pins {teacher.revision}"
             )
         return cache
 

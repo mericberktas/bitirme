@@ -14,6 +14,7 @@ teachers:
   # (encode_teachers fails with a shape error if `dim` is wrong).
   - name: qwen3_8b
     hf_id: Qwen/Qwen3-Embedding-8B
+    revision: 1d8ad4ca9b3dd8059ad90a75d4983776a23d44af
     dim: 4096
     doc_prefix: ""
     max_length: 512
@@ -22,6 +23,7 @@ teachers:
 
 student:
   hf_id: ytu-ce-cosmos/modernbert-tr-base-1k
+  revision: c2e35f553101cce5b03fbb318ef8728473fd34dd
   max_length: 512
   pooling: mean
 

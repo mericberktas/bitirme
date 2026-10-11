@@ -64,6 +64,20 @@ def test_open_validates_cache(tmp_path):
         TeacherCache.open(tmp_path, teacher, "0" * 16, 30)
 
 
+def test_revision_is_recorded_and_checked(tmp_path):
+    texts = make_texts(20)
+    pinned = TeacherConfig("t", "fake/t", 4, revision="abc123")
+    fp = corpus_fingerprint(texts)
+    path = encode_teacher(pinned, texts, tmp_path, 40, encode_fn=fake_encode_fn(4, 0), fingerprint=fp, verbose=False)
+    assert json.loads((path / "meta.json").read_text(encoding="utf-8"))["revision"] == "abc123"
+    TeacherCache.open(tmp_path, pinned, fp, 20)  # matches
+    # Config without a pin is accepted (nothing to compare against).
+    TeacherCache.open(tmp_path, TeacherConfig("t", "fake/t", 4), fp, 20)
+    # A different pinned revision must be rejected.
+    with pytest.raises(ValueError, match="revision"):
+        TeacherCache.open(tmp_path, TeacherConfig("t", "fake/t", 4, revision="def456"), fp, 20)
+
+
 def test_fingerprint_depends_on_content_and_order():
     a = make_texts(10)
     assert corpus_fingerprint(a) == corpus_fingerprint(list(a))

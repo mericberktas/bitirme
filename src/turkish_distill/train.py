@@ -236,7 +236,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     texts = load_corpus(cfg.data, cfg.train.seed)
     fingerprint = corpus_fingerprint(texts)
     caches = {t.name: TeacherCache.open(cfg.data.cache_dir, t, fingerprint, len(texts)) for t in cfg.teachers}
-    tokenizer = AutoTokenizer.from_pretrained(cfg.student.hf_id)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.student.hf_id, revision=cfg.student.revision)
     model = StudentEncoder.from_pretrained(cfg.student, cfg.teachers)
 
     sts_data = None

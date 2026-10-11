@@ -61,6 +61,11 @@ pytest
 
 The tests use a tiny backbone and fake teachers. They verify the code paths (losses, cache, checkpoint/resume, logging), not model quality.
 
+## Reproducibility notes
+
+- Teacher and student models are pinned by Hugging Face commit hash (`revision` in the configs). The teacher revision is stored in each cache's `meta.json` and checked when the cache is opened.
+- The HF model cache is kept on the Colab local disk (`HF_HOME=/content/hf_cache`), not on Drive; only the teacher vectors, corpus, checkpoints and logs go to Drive.
+
 ## Known limitations
 
 - Not yet run against the real models on a GPU. Teacher dimensions, prefixes and library versions in `configs/` come from model cards and must be verified on the first Colab run.
