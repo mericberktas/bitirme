@@ -200,6 +200,47 @@ def _unescape(text: Optional[str]) -> Optional[str]:
 
 _PROTOCOL_KEYS = ("model", "revision", "dtype", "max_seq_length")
 
+# Program run by `run_evaluation_isolated` in a fresh Python process.
+_CHILD_CODE = (
+    "import json, sys\n"
+    "from turkish_distill.eval.trmteb import run_evaluation\n"
+    "run_evaluation(**json.loads(sys.stdin.read()))\n"
+)
+
+
+def run_evaluation_isolated(label: str, output_dir: str | Path, **kwargs) -> Path:
+    """Run `run_evaluation` in a separate Python process and stream its output.
+
+    A CUDA error ("device-side assert") makes the whole process's CUDA context unusable, so in one
+    process a single bad model (e.g. incompatible remote code) makes every later model fail too.
+    Running each model in its own process confines such failures to that model.
+
+    All arguments must be JSON-serialisable (they are for the notebook presets). Raises RuntimeError
+    if the child exits with an error; its output (including the traceback) has already been printed.
+    """
+    import subprocess
+
+    payload = json.dumps({"label": label, "output_dir": str(output_dir), **kwargs})
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _CHILD_CODE],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    assert proc.stdin is not None and proc.stdout is not None
+    proc.stdin.write(payload.encode("utf-8"))
+    proc.stdin.close()
+    while True:  # raw chunks, so progress bars (carriage returns) keep working in notebooks
+        chunk = proc.stdout.read1(4096)
+        if not chunk:
+            break
+        sys.stdout.write(chunk.decode("utf-8", errors="replace"))
+        sys.stdout.flush()
+    code = proc.wait()
+    if code != 0:
+        raise RuntimeError(f"evaluation of {label!r} failed in its own process (exit code {code}); see the output above")
+    return Path(output_dir) / label
+
 
 def prepare_reuse(
     output_dir: str | Path,
@@ -238,6 +279,40 @@ def prepare_reuse(
         else:
             remaining.append(task)
     return reused, remaining
+
+
+_RUN_PROTOCOL_KEYS = ("model", "revision", "dtype", "max_seq_length", "prompts")
+
+
+def check_label_protocol(label_dir: str | Path, protocol: dict, overwrite: bool = False) -> None:
+    """Refuse to add results to a label that was produced under a different protocol.
+
+    MTEB skips tasks that already have a result file, so re-running a label with another dtype,
+    prompt or sequence length would silently keep the stale scores and mix two protocols.
+    """
+    info_path = Path(label_dir) / "run_info.json"
+    if overwrite or not info_path.exists():
+        return
+    try:
+        previous = json.loads(info_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    changed = {
+        k: (previous.get(k), protocol.get(k)) for k in _RUN_PROTOCOL_KEYS if k in previous and previous[k] != protocol.get(k)
+    }
+    if changed:
+        raise ValueError(
+            f"{label_dir} already holds results from a different protocol (previous, requested): {changed}. "
+            "Use a different label, or overwrite=True to recompute."
+        )
+
+
+def pending_tasks(label_dir: str | Path, needed: list[str], overwrite: bool = False) -> list[str]:
+    """Tasks of `needed` that have no result under `label_dir` yet (all of them when overwriting)."""
+    if overwrite:
+        return list(needed)
+    have = set(collect_task_scores(label_dir))
+    return [t for t in needed if t not in have]
 
 
 def run_evaluation(
@@ -303,6 +378,12 @@ def run_evaluation(
     if passage_prompt is not None:
         prompts["passage"] = passage_prompt
 
+    check_label_protocol(
+        label_dir,
+        {"model": model, "revision": revision, "dtype": dtype, "max_seq_length": max_seq_length, "prompts": prompts},
+        overwrite,
+    )
+
     # Prompts only reach retrieval tasks (queries vs passages), so the other tasks score exactly
     # the same as in a plain run of the same model: reuse them instead of recomputing.
     tasks_to_run: Optional[list[str]] = list(task_names) if task_names else None
@@ -329,7 +410,15 @@ def run_evaluation(
     }
     (label_dir / "run_info.json").write_text(json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    if tasks_to_run is None or tasks_to_run:  # an empty list means everything was reused
+    # Only load the model if some task still needs it: a finished (or fully reused) label costs nothing.
+    needed = list(TASK_CATEGORIES) if tasks_to_run is None else list(tasks_to_run)
+    todo = pending_tasks(label_dir, needed, overwrite)
+    if not todo:
+        print(f"[{label}] all {len(needed)} requested tasks already have results: nothing to evaluate", flush=True)
+    else:
+        if todo != needed:
+            print(f"[{label}] {len(needed) - len(todo)} of {len(needed)} tasks already done, evaluating {len(todo)}", flush=True)
+        tasks_to_run = todo
         st_model = SentenceTransformer(
             model,
             revision=revision,
@@ -341,7 +430,7 @@ def run_evaluation(
             st_model.max_seq_length = max_seq_length
         st_model.prompts = prompts
         st_model.default_prompt_name = None
-        tasks = mteb.get_tasks(tasks=tasks_to_run, languages=["tur"]) if tasks_to_run else benchmark
+        tasks = benchmark if len(tasks_to_run) == len(TASK_CATEGORIES) else mteb.get_tasks(tasks=tasks_to_run, languages=["tur"])
         try:
             MTEB(tasks=tasks).run(
                 st_model,

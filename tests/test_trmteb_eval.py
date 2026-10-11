@@ -183,3 +183,136 @@ def test_prepare_reuse_rejects_a_different_protocol_or_missing_or_prompted_sourc
 def test_run_evaluation_requires_prompts_for_reuse():
     with pytest.raises(ValueError, match="only makes sense"):
         trmteb.run_evaluation("x/y", "out", reuse_from="plain")
+
+
+# --- running an evaluation in its own process -----------------------------------------------
+
+def test_isolated_run_reports_failure_and_prints_the_childs_error(tmp_path, capsys):
+    # mteb is not installed in the test environment, so the child fails with the ImportError.
+    with pytest.raises(RuntimeError, match="failed in its own process"):
+        trmteb.run_evaluation_isolated(label="x", output_dir=tmp_path, model="a/b")
+    assert "mteb_tr" in capsys.readouterr().out
+
+
+def test_isolated_run_streams_output_and_returns_the_label_dir(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        trmteb, "_CHILD_CODE",
+        "import json, sys\nkw = json.loads(sys.stdin.read())\nprint('child got', kw['model'], kw['label'], flush=True)\n",
+    )
+    out = trmteb.run_evaluation_isolated(label="lbl", output_dir=tmp_path, model="a/b")
+    assert out == tmp_path / "lbl"
+    assert "child got a/b lbl" in capsys.readouterr().out
+
+
+def test_one_failing_child_does_not_affect_the_next_one(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        trmteb, "_CHILD_CODE",
+        "import json, sys\nkw = json.loads(sys.stdin.read())\nsys.exit(3 if kw['model'] == 'bad' else 0)\n",
+    )
+    with pytest.raises(RuntimeError, match="exit code 3"):
+        trmteb.run_evaluation_isolated(label="a", output_dir=tmp_path, model="bad")
+    assert trmteb.run_evaluation_isolated(label="b", output_dir=tmp_path, model="good") == tmp_path / "b"
+
+
+# --- skipping finished work, protecting a label from protocol mixing --------------------------
+
+def test_pending_tasks(tmp_path):
+    write_result(tmp_path, "STSbTR", 0.5)
+    write_result(tmp_path, "MnliTr", 0.5)
+    assert trmteb.pending_tasks(tmp_path, ["STSbTR", "MnliTr", "SciFactTR"]) == ["SciFactTR"]
+    assert trmteb.pending_tasks(tmp_path, ["STSbTR"]) == []
+    assert trmteb.pending_tasks(tmp_path, ["STSbTR", "MnliTr"], overwrite=True) == ["STSbTR", "MnliTr"]
+
+
+def test_check_label_protocol(tmp_path):
+    proto = {"model": "a/b", "revision": "r", "dtype": "float16", "max_seq_length": 512, "prompts": {}}
+    trmteb.check_label_protocol(tmp_path, proto)  # no run_info yet: fine
+    (tmp_path / "run_info.json").write_text(json.dumps({**proto, "batch_size": 8}), encoding="utf-8")
+    trmteb.check_label_protocol(tmp_path, {**proto})  # same protocol (batch size is not part of it)
+    for key, new in (("dtype", "float32"), ("max_seq_length", 256), ("revision", "other"), ("prompts", {"query": "q: "})):
+        with pytest.raises(ValueError, match="different protocol"):
+            trmteb.check_label_protocol(tmp_path, {**proto, key: new})
+    trmteb.check_label_protocol(tmp_path, {**proto, "dtype": "float32"}, overwrite=True)  # explicit override
+
+
+class _FakeEnv:
+    """Fake mteb + sentence_transformers so run_evaluation's control flow can be tested on CPU."""
+
+    def __init__(self, monkeypatch):
+        import types
+
+        self.loaded: list[str] = []
+        self.ran: list[list[str]] = []
+        env = self
+
+        class FakeBenchmark:
+            tasks = list(TASK_CATEGORIES)
+
+        class FakeMTEB:
+            def __init__(self, tasks):
+                self.tasks = tasks
+
+            def run(self, model, output_folder, **kwargs):
+                names = [getattr(t, "name", t) for t in (self.tasks.tasks if hasattr(self.tasks, "tasks") else self.tasks)]
+                env.ran.append(names)
+                for name in names:
+                    write_result(Path(output_folder) / "inner" / "rev", name, 0.6)
+
+        class FakeST:
+            def __init__(self, name, **kwargs):
+                env.loaded.append(name)
+
+        fake_mteb = types.ModuleType("mteb")
+        fake_mteb.get_benchmark = lambda n: FakeBenchmark()
+        fake_mteb.get_tasks = lambda tasks, languages=None: [types.SimpleNamespace(name=t) for t in tasks]
+        fake_mteb.MTEB = FakeMTEB
+        fake_mteb.__version__ = "fake"
+        fake_st = types.ModuleType("sentence_transformers")
+        fake_st.SentenceTransformer = FakeST
+        monkeypatch.setitem(sys.modules, "mteb", fake_mteb)
+        monkeypatch.setitem(sys.modules, "sentence_transformers", fake_st)
+
+
+from pathlib import Path  # noqa: E402  (used by the fake above)
+
+
+def test_finished_label_does_not_load_the_model_again(tmp_path, monkeypatch, capsys):
+    env = _FakeEnv(monkeypatch)
+    trmteb.run_evaluation("a/b", tmp_path, revision="r", label="m", dtype="float32")
+    assert env.loaded == ["a/b"] and len(env.ran) == 1 and len(env.ran[0]) == 26
+    out = trmteb.run_evaluation("a/b", tmp_path, revision="r", label="m", dtype="float32")
+    assert env.loaded == ["a/b"], "the model must not be loaded a second time"
+    assert len(env.ran) == 1
+    assert "nothing to evaluate" in capsys.readouterr().out
+    assert (out / "summary.json").exists()
+
+
+def test_partial_label_only_evaluates_the_missing_tasks(tmp_path, monkeypatch):
+    env = _FakeEnv(monkeypatch)
+    label_dir = tmp_path / "m"
+    for task in list(TASK_CATEGORIES)[:20]:
+        write_result(label_dir / "inner" / "rev", task, 0.5)
+    trmteb.run_evaluation("a/b", tmp_path, label="m")
+    assert len(env.loaded) == 1
+    assert sorted(env.ran[0]) == sorted(list(TASK_CATEGORIES)[20:])
+
+
+def test_prompted_label_reuses_plain_results_and_loads_nothing_when_all_present(tmp_path, monkeypatch):
+    env = _FakeEnv(monkeypatch)
+    plain = {"model": "a/b", "revision": None, "dtype": "float32", "max_seq_length": 512, "prompts": {}}
+    run = tmp_path / "plain"
+    write_all_except(run / "inner" / "rev")
+    (run / "run_info.json").write_text(json.dumps(plain), encoding="utf-8")
+    trmteb.run_evaluation("a/b", tmp_path, label="prompted", query_prompt="q: ", reuse_from="plain")
+    assert env.loaded == ["a/b"]
+    assert len(env.ran) == 1 and all(TASK_CATEGORIES[t] == "Retrieval" for t in env.ran[0]) and len(env.ran[0]) == 11
+    # second call: retrieval is now present too, so no model load at all
+    trmteb.run_evaluation("a/b", tmp_path, label="prompted", query_prompt="q: ", reuse_from="plain")
+    assert env.loaded == ["a/b"] and len(env.ran) == 1
+
+
+def test_changing_dtype_for_an_existing_label_is_refused(tmp_path, monkeypatch):
+    _FakeEnv(monkeypatch)
+    trmteb.run_evaluation("a/b", tmp_path, label="m", dtype="float16")
+    with pytest.raises(ValueError, match="different protocol"):
+        trmteb.run_evaluation("a/b", tmp_path, label="m", dtype="float32")
