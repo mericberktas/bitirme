@@ -32,7 +32,8 @@ data:
   text_column: text
   cache_dir: /content/drive/MyDrive/bitirme/cache/teachers
   shard_size: 10000          # ~26 min of Qwen3-8B encoding per shard on an L4: the most work lost if a session dies
-  max_samples: 1000000
+  max_samples: 200000        # fixed here, NOT via notebook overrides: it changes the corpus fingerprint, so
+                             # every teacher cache (and both experiments) must use the same value
   min_chars: 20
   val_size: 2000
 

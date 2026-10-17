@@ -8,15 +8,8 @@ local_tmp_dir: /content/ckpt_staging
 tensorboard: true
 
 teachers:
-  - name: qwen3_8b
-    hf_id: Qwen/Qwen3-Embedding-8B
-    revision: 1d8ad4ca9b3dd8059ad90a75d4983776a23d44af
-    dim: 4096
-    doc_prefix: ""
-    max_length: 512
-    batch_size: 32
-    dtype: bfloat16
-    weight: 1.0
+  # Order matters only for encoding: cheap teachers first, so the pipeline can be checked end to end
+  # before the multi-hour Qwen3-8B encoding.
   - name: bge_m3
     hf_id: BAAI/bge-m3
     revision: 5617a9f61b028005a4858fdac845db406aefb181
@@ -35,6 +28,15 @@ teachers:
     batch_size: 64
     dtype: float16
     weight: 1.0
+  - name: qwen3_8b
+    hf_id: Qwen/Qwen3-Embedding-8B
+    revision: 1d8ad4ca9b3dd8059ad90a75d4983776a23d44af
+    dim: 4096
+    doc_prefix: ""
+    max_length: 512
+    batch_size: 32
+    dtype: bfloat16
+    weight: 1.0
 
 student:
   hf_id: ytu-ce-cosmos/modernbert-tr-base-1k
@@ -47,7 +49,8 @@ data:
   text_column: text
   cache_dir: /content/drive/MyDrive/bitirme/cache/teachers
   shard_size: 10000          # ~26 min of Qwen3-8B encoding per shard on an L4: the most work lost if a session dies
-  max_samples: 1000000
+  max_samples: 200000        # fixed here, NOT via notebook overrides: it changes the corpus fingerprint, so
+                             # every teacher cache (and both experiments) must use the same value
   min_chars: 20
   val_size: 2000
 
