@@ -8,6 +8,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -142,6 +143,21 @@ _SECTIONS = {
 }
 
 
+_SCIENTIFIC_WITHOUT_DOT = re.compile(r"^[+-]?\d+[eE][+-]?\d+$")
+
+
+def parse_override_value(text: str) -> Any:
+    """YAML value of a command-line override.
+
+    PyYAML (YAML 1.1) reads `3e-05` as a string because the mantissa has no dot, while `3.0e-05` is a float;
+    notebooks and shells naturally produce the first form, so it is converted here.
+    """
+    value = yaml.safe_load(text)
+    if isinstance(value, str) and _SCIENTIFIC_WITHOUT_DOT.match(value.strip()):
+        return float(value)
+    return value
+
+
 def _set_dotted(d: dict[str, Any], dotted: str, value: Any) -> None:
     parts = dotted.split(".")
     for p in parts[:-1]:
@@ -157,7 +173,7 @@ def load_config(path: str | Path, overrides: Optional[list[str]] = None) -> Expe
         if "=" not in item:
             raise ValueError(f"override must look like key=value, got {item!r}")
         key, value = item.split("=", 1)
-        _set_dotted(raw, key.strip(), yaml.safe_load(value))
+        _set_dotted(raw, key.strip(), parse_override_value(value))
     cfg = _build(ExperimentConfig, raw)
     validate(cfg)
     return cfg

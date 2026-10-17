@@ -55,3 +55,14 @@ def test_fingerprint_changes_with_config(tmp_path):
     b = load_config(write(tmp_path, YAML), ["train.max_steps=11"])
     assert a.fingerprint() != b.fingerprint()
     assert a.fingerprint() == load_config(write(tmp_path, YAML)).fingerprint()
+
+
+def test_distillation_overrides_accept_scientific_notation_without_a_dot(tmp_path):
+    import yaml
+
+    from turkish_distill.config import load_config, parse_override_value
+
+    assert parse_override_value("3e-05") == pytest.approx(3e-5) and parse_override_value("abc") == "abc"
+    path = tmp_path / "c.yaml"
+    path.write_text(yaml.safe_dump({"name": "x", "output_dir": "o", "teachers": [{"name": "t", "hf_id": "h", "dim": 4}]}), encoding="utf-8")
+    assert load_config(path, ["train.lr=3e-05"]).train.lr == pytest.approx(3e-5)
