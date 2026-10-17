@@ -39,3 +39,7 @@ Thumbs.db
 
 # Local Claude Code settings
 .claude/settings.local.json
+
+# Report and research notes: local only (decided 2026-10-17)
+rapor/
+arastirma/
