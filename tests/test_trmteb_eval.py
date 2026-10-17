@@ -37,6 +37,22 @@ def test_task_registry_matches_the_paper():
     }
 
 
+def test_task_groups_partition_the_benchmark():
+    grouped = [t for tasks in trmteb.TASK_GROUPS.values() for t in tasks]
+    assert sorted(grouped) == sorted(TASK_CATEGORIES)  # every task in exactly one group
+
+
+def test_group_means_and_incomplete_groups(tmp_path):
+    write_all(tmp_path, lambda t: 0.5 if t in trmteb.TASK_GROUPS["NLI"] else 0.8)
+    s = summarize_dir(tmp_path)
+    assert s["groups"]["NLI"] == pytest.approx(50.0) and s["groups"]["STS"] == pytest.approx(80.0)
+    partial = summarize_scores({"STSbTR": {"score": 80.0}, "MnliTr": {"score": 60.0}})
+    assert partial["groups"]["STS"] == pytest.approx(80.0)
+    assert partial["groups"]["NLI"] is None  # SnliTr and XNLI are missing
+    table = trmteb.format_group_table({"m": s, "p": partial})
+    assert "NLI" in table and "50.00" in table
+
+
 def test_sanitize_label():
     assert sanitize_label("BAAI/bge-m3") == "BAAI__bge-m3"
     assert sanitize_label("BAAI/bge-m3", "5617a9f61b028005") == "BAAI__bge-m3_5617a9f6"

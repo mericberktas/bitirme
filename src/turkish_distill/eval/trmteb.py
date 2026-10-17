@@ -70,6 +70,20 @@ TASK_CATEGORIES: dict[str, str] = {
     "SCIDOCSTR": "Retrieval",
     "SciFactTR": "Retrieval",
 }
+# Finer, skill-oriented grouping of the same 26 tasks (our own; not part of TR-MTEB). The official
+# categories hide differences: hard scientific retrieval and QA retrieval behave very differently,
+# and so do topic classification and sentiment. Used to see which teacher's strength a student inherits.
+TASK_GROUPS: dict[str, list[str]] = {
+    "RetrHard": ["ArguAnaTR", "SCIDOCSTR", "NFCorpusTR", "SciFactTR", "FiQA2018TR", "CQADupstackGamingRetrievalTR"],
+    "RetrQA": ["MSMarcoTRRetrieval", "QuoraRetrievalTR", "SquadTRRetrieval", "TQuadRetrieval", "XQuADRetrieval"],
+    "NLI": ["MnliTr", "SnliTr", "XNLI"],
+    "STS": ["STSbTR"],
+    "Sentiment": ["THYSentimentClassification", "TurkishMovieSentimentClassification", "TurkishProductSentimentClassification"],
+    "Pragmatic": ["TurkishIronyClassification", "TurkishOffensiveLanguageClassification"],
+    "Topic": ["Turkish75NewsClassification", "TurkishNewsCategoryClassification", "TSTimelineNewsCategoryClassification"],
+    "Clustering": ["TurkishAbstractCorpusClustering", "TurkishColumnWritingClustering"],
+    "Bitext": ["WMT16BitextMining"],
+}
 CATEGORY_ORDER = ["Retrieval", "Classification", "Clustering", "PairClassification", "STS", "BitextMining"]
 _SPLIT_PREFERENCE = ("test", "validation", "dev", "train")
 _IGNORED_FILES = {"model_meta.json", "summary.json", "run_info.json"}
@@ -153,6 +167,11 @@ def summarize_scores(task_scores: dict[str, dict]) -> dict:
         "mean_type": _mean(list(category_means.values())),
         "mean_type_no_bitext": _mean(no_bitext_cats),
         "categories": category_means,
+        # a group mean is reported only when all its tasks are present (otherwise it is not comparable)
+        "groups": {
+            g: _mean([known[t] for t in tasks]) if all(t in known for t in tasks) else None
+            for g, tasks in TASK_GROUPS.items()
+        },
         "per_task": {t: known[t] for t in sorted(known)},
     }
 
@@ -187,6 +206,18 @@ def format_table(summaries: dict[str, dict]) -> str:
         if not summary["complete"]:
             row += "  (INCOMPLETE: averages not comparable)"
         lines.append(row)
+    return "\n".join(lines)
+
+
+def format_group_table(summaries: dict[str, dict]) -> str:
+    """Plain-text table of the skill groups in TASK_GROUPS, one row per model label."""
+    groups = list(TASK_GROUPS)
+    width = max([len("model")] + [len(k) for k in summaries]) + 2
+    header = "model".ljust(width) + "".join(g.rjust(11) for g in groups)
+    lines = [header, "-" * len(header)]
+    for label, summary in summaries.items():
+        values = summary.get("groups", {})
+        lines.append(label.ljust(width) + "".join(_fmt(values.get(g)).rjust(11) for g in groups))
     return "\n".join(lines)
 
 
@@ -478,6 +509,8 @@ def _cmd_run(args: argparse.Namespace) -> None:
 def _cmd_summarize(args: argparse.Namespace) -> None:
     summaries = {Path(d).name: summarize_dir(d) for d in args.dirs}
     print(format_table(summaries))
+    print()
+    print(format_group_table(summaries))
     for label, summary in summaries.items():
         if summary["missing_tasks"]:
             print(f"\n{label}: missing tasks: {', '.join(summary['missing_tasks'])}")
