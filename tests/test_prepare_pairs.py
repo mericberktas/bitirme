@@ -158,3 +158,20 @@ def test_main_writes_all_outputs(tmp_path):
     assert len(corpus) == len(set(corpus)) == stats["corpus_train_texts"]
     val_questions = {json.loads(line)["question"] for line in open(out / "pairs_val.jsonl", encoding="utf-8")}
     assert not val_questions & set(corpus)  # no validation question leaks into the distillation corpus
+
+
+def test_main_with_forbidden_file_drops_leaked_pairs_in_both_splits(tmp_path):
+    leaked = " ".join(f"sizinti{i}" for i in range(20))
+    write_turhistquad(
+        tmp_path / "thq",
+        [thq("1", "Temiz soru bir mi?", "Temiz pasaj bir"), thq("2", "Sizan pasajli soru mu?", "giris " + leaked + " cikis")],
+        [thq("3", "Dogrulama sorusu mu?", "Dogrulama pasaji"), thq("4", "Sizan dogrulama mi?", "x " + leaked)],
+    )
+    forbidden = tmp_path / "forbidden.jsonl"
+    forbidden.write_text(json.dumps({"text": leaked}) + "\n" + json.dumps({"text": "alakasiz benchmark metni burada"}) + "\n", encoding="utf-8")
+    out = tmp_path / "out"
+    pp.main(["--turhistquad-dir", str(tmp_path / "thq"), "--forbidden", str(forbidden), "--out-dir", str(out)])
+    stats = json.loads((out / "stats.json").read_text(encoding="utf-8"))
+    assert stats["decontaminated"] is True
+    assert stats["train_dropped_decontamination"] == 1 and stats["val_dropped_decontamination"] == 1
+    assert [json.loads(l)["question"] for l in open(out / "pairs_train.jsonl", encoding="utf-8")] == ["Temiz soru bir mi?"]

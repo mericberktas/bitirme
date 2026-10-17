@@ -31,7 +31,7 @@ import json
 import random
 import re
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, Optional
 
 SQUAD_ID = re.compile(r"[0-9a-f]{24}")
 Pair = dict
@@ -179,14 +179,25 @@ def decontaminate(pairs: list[Pair], forbidden: Iterable[str], n: int = 13) -> t
 
     Texts shorter than n words (typical benchmark queries) can only match exactly after normalisation.
     """
-    exact: set[str] = set()
-    grams: set[int] = set()
+    # Memory: the benchmark side can be millions of texts (MS MARCO-TR alone has 1.1M passages), our side is
+    # tens of thousands. So index OUR n-grams and stream the benchmark texts once, remembering which of our
+    # n-grams / texts occur there.
+    ours_exact: set[str] = set()
+    ours_grams: set[int] = set()
+    for p in pairs:
+        for text in (p["passage"], p["question"]):
+            ours_exact.add(normalize(text).lower())
+            ours_grams |= _ngram_hashes(text, n)
+    hit_exact: set[str] = set()
+    hit_grams: set[int] = set()
     for text in forbidden:
-        exact.add(normalize(text).lower())
-        grams |= _ngram_hashes(text, n)
+        lowered = normalize(text).lower()
+        if lowered in ours_exact:
+            hit_exact.add(lowered)
+        hit_grams.update(g for g in _ngram_hashes(text, n) if g in ours_grams)
 
     def hit(text: str) -> bool:
-        return normalize(text).lower() in exact or bool(_ngram_hashes(text, n) & grams)
+        return normalize(text).lower() in hit_exact or bool(_ngram_hashes(text, n) & hit_grams)
 
     kept = [p for p in pairs if not hit(p["passage"]) and not hit(p["question"])]
     return kept, len(pairs) - len(kept)
@@ -268,6 +279,19 @@ def _write_jsonl(path: Path, rows: Iterable[dict]) -> int:
     return n
 
 
+class JsonlTexts:
+    """Re-iterable view of a JSONL file with a "text" field (read lazily, millions of lines fit)."""
+
+    def __init__(self, path: str | Path):
+        self.path = path
+
+    def __iter__(self) -> Iterator[str]:
+        with open(self.path, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    yield json.loads(line)["text"]
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--turhistquad-dir", default=None)
@@ -300,7 +324,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     train, val = merge(train_parts, val_parts, args.wikirag_val_size, wikirag_pairs, args.seed, stats,
                        max_q_per_passage=args.max_q_per_passage)
     if args.forbidden:
-        forbidden = [json.loads(line)["text"] for line in open(args.forbidden, encoding="utf-8") if line.strip()]
+        forbidden = JsonlTexts(args.forbidden)
         train, stats["train_dropped_decontamination"] = decontaminate(train, forbidden)
         val, stats["val_dropped_decontamination"] = decontaminate(val, forbidden)
 
