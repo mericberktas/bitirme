@@ -1,0 +1,44 @@
+# Contrastive baseline (no teachers): in-batch-negative InfoNCE on (question, passage) pairs from the three QA
+# datasets suggested by the advisor (see prepare_pairs). The notebook overrides name, loss, scale, batch size,
+# student and epochs, so one file covers the whole grid; the run folder name carries the settings.
+#
+# Learning rate, epochs and scale below are untuned starting values, not results.
+
+name: contrastive_mnrl
+output_dir: /content/drive/MyDrive/bitirme/runs
+local_tmp_dir: /content/ckpt_staging
+tensorboard: true
+
+student:
+  hf_id: ytu-ce-cosmos/modernbert-tr-base-1k
+  revision: c2e35f553101cce5b03fbb318ef8728473fd34dd
+  max_length: 512
+  pooling: mean
+
+data:
+  pairs_train: /content/drive/MyDrive/bitirme/data/stage1/pairs_train.jsonl
+  pairs_val: /content/drive/MyDrive/bitirme/data/stage1/pairs_val.jsonl
+  max_train_pairs: null      # e.g. 2000 for a quick trial
+  query_max_length: 64
+  passage_max_length: 512
+
+loss:
+  name: mnrl                 # mnrl | mnrl_symmetric
+  scale: 20.0                # 1 / temperature (the lab's 0.02 is 50)
+
+train:
+  batch_size: 128            # pairs per batch; every other passage in the batch is a negative
+  chunk_size: null           # e.g. 64 with batch_size 1024: gradient caching, same maths, less memory
+  lr: 3.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  epochs: 3                  # used when max_steps is null
+  max_steps: null
+  grad_clip: 1.0
+  bf16: true
+  seed: 42
+  num_workers: 2
+  log_every: 20
+  eval_every: 100
+  ckpt_every: 200
+  keep_last: 2
