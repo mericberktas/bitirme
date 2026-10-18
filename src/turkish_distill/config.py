@@ -68,6 +68,10 @@ class LossConfig:
 @dataclass
 class TrainConfig:
     batch_size: int = 128
+    # None: the whole batch goes through the encoder at once. Otherwise gradient caching: the batch is encoded in
+    # mini-batches of this size (same maths, memory of one mini-batch). batch_size 128 with 512-token texts ran
+    # out of memory on an L4 (22 GB) without it.
+    chunk_size: Optional[int] = None
     lr: float = 5e-5
     weight_decay: float = 0.01
     warmup_ratio: float = 0.05
@@ -200,6 +204,8 @@ def validate(cfg: ExperimentConfig) -> None:
         raise ValueError("train.warmup_ratio must be in [0, 1)")
     if cfg.train.batch_size < 2:
         raise ValueError("train.batch_size must be >= 2 (similarity losses need pairs)")
+    if cfg.train.chunk_size is not None and cfg.train.chunk_size < 1:
+        raise ValueError("train.chunk_size must be >= 1 or null")
 
 
 def dump_config(cfg: ExperimentConfig, path: str | Path) -> None:

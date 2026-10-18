@@ -2,6 +2,7 @@
 
 import copy
 
+import pytest
 import torch
 
 from conftest import CharTokenizer, TinyBackbone, fake_encode_fn, learnable_encode_fn, make_texts
@@ -97,3 +98,29 @@ def test_validation_retrieval_is_logged_like_the_contrastive_runs(experiment, tm
     model2, caches2 = build(experiment, texts)
     run_training(experiment, plain_run, model2, CharTokenizer(), texts, caches2, torch.device("cpu"))
     assert not any("val/mrr@10" in r for r in read_metrics(plain_run / "metrics.jsonl"))
+
+
+def test_cached_step_matches_the_plain_step_for_the_distillation_loss(experiment):
+    from turkish_distill.config import LossConfig
+    from turkish_distill.losses import MultiTeacherLoss
+    from turkish_distill.train import distill_step
+
+    tok = CharTokenizer()
+    enc = tok([f"ornek {i} metni, biraz uzunca {i * 7 % 5}" for i in range(12)], 64)
+    gen = torch.Generator().manual_seed(1)
+    targets = {t.name: torch.nn.functional.normalize(torch.randn(12, t.dim, generator=gen), dim=-1) for t in experiment.teachers}
+
+    def run(chunk):
+        torch.manual_seed(0)
+        model = StudentEncoder(TinyBackbone(), 16, {t.name: t.dim for t in experiment.teachers})
+        criterion = MultiTeacherLoss(LossConfig(resim_num_samples=64), experiment.teachers, seed=3)
+        logs = distill_step(model, criterion, enc["input_ids"], enc["attention_mask"], targets, chunk_size=chunk)
+        return logs, {n: p.grad.clone() for n, p in model.named_parameters()}
+
+    plain_logs, plain = run(None)
+    for chunk in (1, 5, 12):
+        logs, cached = run(chunk)
+        assert logs["total"] == pytest.approx(plain_logs["total"], rel=1e-5)
+        for name, grad in cached.items():
+            torch.testing.assert_close(grad, plain[name], rtol=1e-4, atol=1e-6, msg=f"{name} chunk={chunk}")
+

@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 
 from .checkpoint import cleanup_stale, latest_checkpoint, load_checkpoint, save_checkpoint
 from .config import ExperimentConfig, dump_config, load_config
-from .contrastive import evaluate_retrieval, load_pairs
+from .contrastive import _capture_rng, _restore_rng, evaluate_retrieval, load_pairs
 from .data import Collator, ListDataset, epoch_batches, load_corpus
 from .diagnostics import effective_rank, geometry_agreement, mean_pairwise_cosine, teacher_cosine
 from .eval.sts import evaluate_sts, load_sts_pairs, make_student_encode_fn
@@ -37,6 +37,55 @@ def build_scheduler(optimizer: torch.optim.Optimizer, total_steps: int, warmup_r
         return max(0.0, (total_steps - step) / max(1, total_steps - warmup))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
+
+
+def distill_step(
+    model: StudentEncoder,
+    criterion: MultiTeacherLoss,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    targets: dict[str, torch.Tensor],
+    chunk_size: Optional[int] = None,
+    use_amp: bool = False,
+) -> dict[str, float]:
+    """One forward/backward pass of the distillation loss; gradients stay on the parameters.
+
+    The losses compare every text with the others in the batch (similarity matrix, relative ranking), so the
+    batch cannot simply be split. With `chunk_size` the pooled embeddings of the whole batch are computed in
+    mini-batches without gradients, the loss and its gradient w.r.t. the pooled embeddings are computed on the
+    full batch (the teacher heads get their gradients there), and each mini-batch is then encoded again with
+    gradients and back-propagated with the stored embedding gradient. The result equals the plain step; the RNG
+    state is restored so dropout masks are the same in both passes.
+    """
+    device = input_ids.device
+
+    def encode(ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+            return model.encode(ids, mask).float()
+
+    size = input_ids.size(0)
+    if chunk_size is None or chunk_size >= size:
+        pooled = encode(input_ids, attention_mask)
+        projections = {name: head(pooled) for name, head in model.heads.items()}
+        loss, logs = criterion(pooled, projections, targets)
+        loss.backward()
+        return logs
+
+    slices = [slice(i, i + chunk_size) for i in range(0, size, chunk_size)]
+    states, parts = [], []
+    with torch.no_grad():
+        for sl in slices:
+            states.append(_capture_rng(device))
+            parts.append(encode(input_ids[sl], attention_mask[sl]))
+    pooled = torch.cat(parts).requires_grad_(True)
+    projections = {name: head(pooled) for name, head in model.heads.items()}
+    loss, logs = criterion(pooled, projections, targets)
+    loss.backward()  # teacher heads get their gradient here; `pooled` gets .grad
+    for sl, state in zip(slices, states):
+        with _restore_rng(state, device):
+            chunk = encode(input_ids[sl], attention_mask[sl])
+        (chunk * pooled.grad[sl]).sum().backward()
+    return logs
 
 
 @torch.no_grad()
@@ -186,11 +235,8 @@ def run_training(
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             targets = {k: v.to(device) for k, v in batch["targets"].items()}
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                pooled, projections = model(input_ids, attention_mask)
-            loss, logs = criterion(pooled.float(), {k: v.float() for k, v in projections.items()}, targets)
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            logs = distill_step(model, criterion, input_ids, attention_mask, targets, t.chunk_size, use_amp)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), t.grad_clip)
             optimizer.step()
             scheduler.step()

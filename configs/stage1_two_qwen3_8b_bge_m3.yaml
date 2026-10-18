@@ -60,6 +60,7 @@ loss:
 
 train:
   batch_size: 128
+  chunk_size: 32             # gradient caching: same maths, memory of 32 texts (null ran out of memory on an L4)
   lr: 5.0e-5
   weight_decay: 0.01
   warmup_ratio: 0.05
