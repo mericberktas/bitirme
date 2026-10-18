@@ -28,7 +28,9 @@ student:
   pooling: mean
 
 data:
-  corpus_path: /content/drive/MyDrive/bitirme/data/corpus.jsonl
+  # The Cosmos corpus after removing TR-MTEB test texts and their near-copies (made by decontaminate_corpus; the
+  # raw one is data/corpus.jsonl). A different text list means a different cache fingerprint.
+  corpus_path: /content/drive/MyDrive/bitirme/data/corpus_clean.jsonl
   text_column: text
   cache_dir: /content/drive/MyDrive/bitirme/cache/teachers
   shard_size: 10000          # ~26 min of Qwen3-8B encoding per shard on an L4: the most work lost if a session dies
