@@ -208,3 +208,9 @@ def test_overrides_in_scientific_notation_without_a_dot_become_numbers(tmp_path)
     assert cfg.train.weight_decay == pytest.approx(0.01)
     assert cfg.name == "1e3x"  # only a bare scientific number is converted, names stay strings
     assert cfg.loss.scale == 20.0 and load_contrastive_config(write_cfg(tmp_path), ["train.lr=5.0e-5"]).train.lr == pytest.approx(5e-5)
+
+
+def test_describe_device_says_plainly_when_there_is_no_gpu():
+    from turkish_distill.utils import describe_device
+
+    assert "NO GPU" in describe_device(torch.device("cpu"))

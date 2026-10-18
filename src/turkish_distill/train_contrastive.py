@@ -34,7 +34,7 @@ from .eval.sts import make_student_encode_fn
 from .logging_utils import MetricsLogger
 from .models import StudentEncoder
 from .train import build_scheduler
-from .utils import get_device, git_sha, set_seed, write_env_info
+from .utils import describe_device, get_device, git_sha, set_seed, write_env_info
 
 
 def run_contrastive(
@@ -192,6 +192,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     model = StudentEncoder.from_pretrained(cfg.student, [])  # no teachers, so no projection heads
 
     print(f"run dir: {run_dir}", flush=True)
+    print(f"device: {describe_device(get_device())}", flush=True)
     print(run_contrastive(cfg, run_dir, model, tokenizer, train_pairs, val_pairs, get_device(), resume=not args.no_resume), flush=True)
 
 

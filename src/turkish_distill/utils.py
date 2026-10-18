@@ -27,6 +27,15 @@ def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def describe_device(device: torch.device) -> str:
+    """One line for the log, e.g. 'cuda: NVIDIA L4, 22.0 GB'. TensorFlow (pulled in by TensorBoard) may print
+    'Could not find cuda drivers' on the same machine; that message is about TensorFlow, not PyTorch."""
+    if device.type != "cuda":
+        return f"{device.type} (NO GPU: training will be very slow)"
+    props = torch.cuda.get_device_properties(device)
+    return f"cuda: {props.name}, {props.total_memory / 1e9:.1f} GB"
+
+
 def git_sha(cwd: Optional[str | Path] = None) -> Optional[str]:
     try:
         out = subprocess.run(

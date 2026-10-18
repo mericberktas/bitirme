@@ -25,7 +25,7 @@ from .logging_utils import MetricsLogger
 from .losses import MultiTeacherLoss
 from .models import StudentEncoder
 from .teachers import TeacherCache, corpus_fingerprint
-from .utils import get_device, git_sha, set_seed, write_env_info
+from .utils import describe_device, get_device, git_sha, set_seed, write_env_info
 
 
 def build_scheduler(optimizer: torch.optim.Optimizer, total_steps: int, warmup_ratio: float):
@@ -264,6 +264,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     retrieval_val = load_pairs(cfg.eval.pairs_val) if cfg.eval.pairs_val else None
 
     print(f"run dir: {run_dir}", flush=True)
+    print(f"device: {describe_device(get_device())}", flush=True)
     result = run_training(
         cfg, run_dir, model, tokenizer, texts, caches, get_device(), sts_data=sts_data, resume=not args.no_resume,
         retrieval_val=retrieval_val,
