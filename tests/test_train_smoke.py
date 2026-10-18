@@ -124,3 +124,17 @@ def test_cached_step_matches_the_plain_step_for_the_distillation_loss(experiment
         for name, grad in cached.items():
             torch.testing.assert_close(grad, plain[name], rtol=1e-4, atol=1e-6, msg=f"{name} chunk={chunk}")
 
+
+
+def test_a_phased_in_teacher_ramps_up_during_training_and_is_logged(experiment, tmp_path):
+    experiment.teachers[1].weight_start = 0.0  # t_big (weight 2.0) starts at 0 and reaches 2.0 at step 6
+    experiment.teachers[1].ramp_start_step = 0
+    experiment.teachers[1].ramp_end_step = 6
+    texts = make_texts(120)
+    model, caches = build(experiment, texts)
+    run_dir = tmp_path / "run"
+    run_training(experiment, run_dir, model, CharTokenizer(), texts, caches, torch.device("cpu"))
+    train = [r for r in read_metrics(run_dir / "metrics.jsonl") if "train/total" in r]
+    ramp = [r["train/weight/t_big"] for r in train]  # means over steps (0,1), (2,3), (4,5) of 0, 1/3, 2/3, ... * 2
+    assert ramp == sorted(ramp) and 0.0 < ramp[0] < ramp[-1] < 2.0
+    assert all(r["train/weight/t_small"] == 1.0 for r in train)

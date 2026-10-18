@@ -236,6 +236,7 @@ def run_training(
             attention_mask = batch["attention_mask"].to(device)
             targets = {k: v.to(device) for k, v in batch["targets"].items()}
             optimizer.zero_grad(set_to_none=True)
+            criterion.set_step(step)  # `step` steps are done, this is step number `step` (teacher weights may ramp)
             logs = distill_step(model, criterion, input_ids, attention_mask, targets, t.chunk_size, use_amp)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), t.grad_clip)
             optimizer.step()

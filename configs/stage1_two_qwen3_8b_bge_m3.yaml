@@ -2,6 +2,10 @@
 # Pick BGE-M3 : Qwen with the indices below, e.g. `teachers.0.weight=2` `teachers.1.weight=1`:
 #   teachers.0 = bge_m3     teachers.1 = qwen3_8b
 # The total loss divides by the sum of the weights, so only the ratio matters (1:1, 2:1, 1:2 ...).
+# A weight can also change during training (`weight_start`, `ramp_start_step`, `ramp_end_step` on a teacher):
+# it is `weight_start` until the ramp starts, rises linearly to `weight` at the end step and then stays. Example:
+# `teachers.1.weight_start=0` `teachers.1.ramp_end_step=900` phases Qwen in over the first half of the 1800 steps
+# while BGE-M3 has its full weight from the start (a teacher the student imitates poorly joins later).
 # Everything but the teacher list is identical to stage1_single_qwen3_8b.yaml. The teacher vectors are cached per
 # teacher and corpus, so Qwen3-8B and BGE-M3 are encoded once and shared by the single- and two-teacher runs.
 # BGE-M3 is listed first so the cheap teacher is encoded first.

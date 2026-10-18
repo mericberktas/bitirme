@@ -32,8 +32,24 @@ class TeacherConfig:
     # vectors reproducible; it is stored in the cache's meta.json and checked
     # when the cache is opened.
     revision: Optional[str] = None
-    # Relative weight of this teacher in the total loss.
+    # Relative weight of this teacher in the total loss (only the ratio between teachers matters).
     weight: float = 1.0
+    # Optional linear ramp: the weight is `weight_start` until step `ramp_start_step`, rises linearly to `weight`
+    # at step `ramp_end_step` and stays there. `weight_start: null` keeps `weight` constant. Example: a teacher the
+    # student imitates poorly can be phased in after the others (weight_start 0, ramp 0 -> 900).
+    weight_start: Optional[float] = None
+    ramp_start_step: int = 0
+    ramp_end_step: int = 0
+
+
+def teacher_weight(teacher: TeacherConfig, step: int) -> float:
+    """The loss weight of a teacher at a training step (constant unless `weight_start` is set)."""
+    if teacher.weight_start is None or step >= teacher.ramp_end_step:
+        return float(teacher.weight)
+    if step <= teacher.ramp_start_step:
+        return float(teacher.weight_start)
+    fraction = (step - teacher.ramp_start_step) / (teacher.ramp_end_step - teacher.ramp_start_step)
+    return float(teacher.weight_start + fraction * (teacher.weight - teacher.weight_start))
 
 
 @dataclass
@@ -200,6 +216,13 @@ def validate(cfg: ExperimentConfig) -> None:
             raise ValueError(f"teacher {t.name}: dim must be positive")
         if t.weight < 0:
             raise ValueError(f"teacher {t.name}: weight must be >= 0")
+        if t.weight_start is not None:
+            if t.weight_start < 0:
+                raise ValueError(f"teacher {t.name}: weight_start must be >= 0")
+            if t.ramp_end_step < t.ramp_start_step or t.ramp_start_step < 0:
+                raise ValueError(f"teacher {t.name}: need 0 <= ramp_start_step <= ramp_end_step")
+    if sum(teacher_weight(t, 0) for t in cfg.teachers) <= 0:
+        raise ValueError("at step 0 at least one teacher must have a positive weight")
     if cfg.train.warmup_ratio < 0 or cfg.train.warmup_ratio >= 1:
         raise ValueError("train.warmup_ratio must be in [0, 1)")
     if cfg.train.batch_size < 2:

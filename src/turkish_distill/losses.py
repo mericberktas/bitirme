@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .config import LossConfig, TeacherConfig
+from .config import LossConfig, TeacherConfig, teacher_weight
 
 
 def cosine_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -81,13 +81,19 @@ class MultiTeacherLoss(nn.Module):
     def __init__(self, loss_cfg: LossConfig, teachers: list[TeacherConfig], seed: int = 0):
         super().__init__()
         self.cfg = loss_cfg
-        self.weights = {t.name: float(t.weight) for t in teachers}
-        total = sum(self.weights.values())
-        if total <= 0:
+        self.teachers = list(teachers)
+        self._step = 0
+        if sum(self.current_weights().values()) <= 0:
             raise ValueError("sum of teacher weights must be positive")
-        self.weight_sum = total
         self._seed = seed
         self._generators: dict[str, torch.Generator] = {}
+
+    def set_step(self, step: int) -> None:
+        """Tell the loss which training step it is computed for (teacher weights may ramp with the step)."""
+        self._step = int(step)
+
+    def current_weights(self) -> dict[str, float]:
+        return {t.name: teacher_weight(t, self._step) for t in self.teachers}
 
     def _generator(self, device: torch.device) -> torch.Generator:
         key = str(device)
@@ -106,9 +112,14 @@ class MultiTeacherLoss(nn.Module):
         cfg = self.cfg
         total = pooled.new_zeros((), dtype=torch.float32)
         logs: dict[str, float] = {}
-        for name, weight in self.weights.items():
+        weights = self.current_weights()
+        weight_sum = sum(weights.values())
+        if weight_sum <= 0:
+            raise ValueError(f"sum of teacher weights is not positive at step {self._step}")
+        for name, weight in weights.items():
+            logs[f"weight/{name}"] = weight
             if weight == 0.0:
-                continue
+                continue  # also leaves that teacher's head without gradient (no weight decay either)
             target = targets[name].to(pooled.device)
             parts = pooled.new_zeros((), dtype=torch.float32)
             if cfg.cosine_weight:
@@ -129,7 +140,7 @@ class MultiTeacherLoss(nn.Module):
                 )
                 parts = parts + cfg.resim_weight * r
                 logs[f"resim/{name}"] = float(r.detach())
-            total = total + (weight / self.weight_sum) * parts
+            total = total + (weight / weight_sum) * parts
         if cfg.gor_weight:
             g = gor_loss(pooled)
             total = total + cfg.gor_weight * g

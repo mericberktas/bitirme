@@ -95,3 +95,52 @@ def test_loss_normalised_by_weight_sum():
     l1, _ = MultiTeacherLoss(cfg, t1, seed=3)(pooled, projections, targets)
     l2, _ = MultiTeacherLoss(cfg, t2, seed=3)(pooled, projections, targets)
     assert l1.item() == pytest.approx(l2.item(), rel=1e-5)
+
+
+def test_teacher_weight_ramps_linearly_and_is_constant_without_a_start():
+    from turkish_distill.config import teacher_weight
+
+    constant = TeacherConfig("a", "x/a", 8, weight=2.0)
+    assert [teacher_weight(constant, s) for s in (0, 500, 10_000)] == [2.0, 2.0, 2.0]
+    ramp = TeacherConfig("b", "x/b", 8, weight=1.0, weight_start=0.0, ramp_start_step=100, ramp_end_step=300)
+    assert [teacher_weight(ramp, s) for s in (0, 100, 200, 300, 5000)] == pytest.approx([0.0, 0.0, 0.5, 1.0, 1.0])
+    step = TeacherConfig("c", "x/c", 8, weight=1.0, weight_start=0.0, ramp_start_step=50, ramp_end_step=50)
+    assert [teacher_weight(step, s) for s in (49, 50, 51)] == [0.0, 1.0, 1.0]  # no ramp: switched on AT step 50
+
+
+def test_a_ramped_teacher_has_no_effect_until_its_weight_is_positive_and_the_loss_stays_normalised():
+    torch.manual_seed(0)
+    pooled = torch.randn(10, 8)
+    teachers = [TeacherConfig("a", "x/a", 6), TeacherConfig("b", "x/b", 6, weight_start=0.0, ramp_start_step=0, ramp_end_step=100)]
+    projections = {t.name: torch.randn(10, 6) for t in teachers}
+    targets = {t.name: torch.nn.functional.normalize(torch.randn(10, 6), dim=-1) for t in teachers}
+    cfg = LossConfig(resim_num_samples=32)
+
+    ramped = MultiTeacherLoss(cfg, teachers, seed=1)
+    only_a = MultiTeacherLoss(cfg, teachers[:1], seed=1)
+    ramped.set_step(0)
+    l0, logs0 = ramped(pooled, projections, targets)
+    la, _ = only_a(pooled, {"a": projections["a"]}, {"a": targets["a"]})
+    assert l0.item() == pytest.approx(la.item()) and logs0["weight/b"] == 0.0 and "cos/b" not in logs0  # step 0 == single teacher
+    ramped.set_step(50)
+    _, logs50 = ramped(pooled, projections, targets)
+    assert logs50["weight/a"] == 1.0 and logs50["weight/b"] == pytest.approx(0.5) and "cos/b" in logs50
+    # once the ramp is over the loss equals the equal-weight loss (fresh instances: the relative-similarity sampler
+    # advances with every call, so compare first calls)
+    done = MultiTeacherLoss(cfg, teachers, seed=1)
+    done.set_step(100)
+    equal = MultiTeacherLoss(cfg, [TeacherConfig("a", "x/a", 6), TeacherConfig("b", "x/b", 6)], seed=1)
+    assert done(pooled, projections, targets)[0].item() == pytest.approx(equal(pooled, projections, targets)[0].item())
+
+
+def test_ramp_config_is_validated():
+    from turkish_distill.config import ExperimentConfig, validate
+
+    def cfg(*teachers):
+        return ExperimentConfig(name="x", output_dir="o", teachers=list(teachers))
+
+    validate(cfg(TeacherConfig("a", "x/a", 4), TeacherConfig("b", "x/b", 4, weight_start=0.0, ramp_end_step=10)))
+    with pytest.raises(ValueError, match="ramp_start_step"):
+        validate(cfg(TeacherConfig("a", "x/a", 4, weight_start=0.0, ramp_start_step=20, ramp_end_step=10)))
+    with pytest.raises(ValueError, match="at step 0"):  # every teacher starts at weight 0: nothing to imitate
+        validate(cfg(TeacherConfig("a", "x/a", 4, weight_start=0.0, ramp_end_step=10)))
