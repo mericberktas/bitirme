@@ -28,7 +28,10 @@ loss:
 
 train:
   batch_size: 128            # pairs per batch; every other passage in the batch is a negative
-  chunk_size: null           # e.g. 64 with batch_size 1024: gradient caching, same maths, less memory
+  # Gradient caching: the batch is encoded in mini-batches of this size, same maths, memory of one mini-batch.
+  # null (no caching) ran out of memory on an L4 (22 GB) at batch_size 128 with 512-token passages (measured).
+  # The size does not depend on batch_size, so batch_size 1024 needs no more memory than 128 (it is slower).
+  chunk_size: 32
   lr: 3.0e-5
   weight_decay: 0.01
   warmup_ratio: 0.1
