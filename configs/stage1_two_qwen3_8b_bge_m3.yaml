@@ -1,0 +1,79 @@
+# Stage 1, baseline 3: two teachers (BGE-M3 and Qwen3-Embedding-8B), the weights are the experiment.
+# Pick BGE-M3 : Qwen with the indices below, e.g. `teachers.0.weight=2` `teachers.1.weight=1`:
+#   teachers.0 = bge_m3     teachers.1 = qwen3_8b
+# The total loss divides by the sum of the weights, so only the ratio matters (1:1, 2:1, 1:2 ...).
+# Everything but the teacher list is identical to stage1_single_qwen3_8b.yaml. The teacher vectors are cached per
+# teacher and corpus, so Qwen3-8B and BGE-M3 are encoded once and shared by the single- and two-teacher runs.
+# BGE-M3 is listed first so the cheap teacher is encoded first.
+#
+# Why this pair: in our own TR-MTEB scores BGE-M3 leads on NLI and sentiment while Qwen3-8B leads on hard retrieval
+# and clustering. Taking the better teacher per task gives 69.40 for this pair (best single teacher: 67.96), and
+# 69.72 when mE5 is added, i.e. only 0.32 more. These oracle numbers are an upper bound, not an expected result.
+
+name: stage1_two_qwen3_8b_bge_m3
+output_dir: /content/drive/MyDrive/bitirme/runs
+local_tmp_dir: /content/ckpt_staging
+tensorboard: true
+
+teachers:
+  - name: bge_m3
+    hf_id: BAAI/bge-m3
+    revision: 5617a9f61b028005a4858fdac845db406aefb181
+    dim: 1024
+    doc_prefix: ""
+    max_length: 512
+    batch_size: 64
+    dtype: float16
+    weight: 1.0
+  - name: qwen3_8b
+    hf_id: Qwen/Qwen3-Embedding-8B
+    revision: 1d8ad4ca9b3dd8059ad90a75d4983776a23d44af
+    dim: 4096
+    doc_prefix: ""
+    max_length: 512
+    batch_size: 32
+    dtype: bfloat16
+    weight: 1.0
+
+student:
+  hf_id: ytu-ce-cosmos/modernbert-tr-base-1k
+  revision: c2e35f553101cce5b03fbb318ef8728473fd34dd
+  max_length: 512
+  pooling: mean
+
+data:
+  corpus_path: /content/drive/MyDrive/bitirme/data/stage1/corpus_train.jsonl
+  text_column: text
+  cache_dir: /content/drive/MyDrive/bitirme/cache/teachers
+  shard_size: 10000
+  max_samples: null
+  min_chars: 10
+  val_size: 2000
+
+loss:
+  cosine_weight: 10.0
+  sim_weight: 200.0
+  resim_weight: 20.0
+  resim_margin: 0.015
+  resim_num_samples: 4096
+  gor_weight: 0.0
+
+train:
+  batch_size: 128
+  lr: 5.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_steps: 1800
+  grad_clip: 1.0
+  bf16: true
+  seed: 42
+  num_workers: 2
+  log_every: 25
+  diag_every: 300
+  ckpt_every: 300
+  keep_last: 2
+
+eval:
+  sts_dataset: null
+  pairs_val: /content/drive/MyDrive/bitirme/data/stage1/pairs_val.jsonl
+  query_max_length: 64

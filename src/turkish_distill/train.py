@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader
 
 from .checkpoint import cleanup_stale, latest_checkpoint, load_checkpoint, save_checkpoint
 from .config import ExperimentConfig, dump_config, load_config
+from .contrastive import evaluate_retrieval, load_pairs
 from .data import Collator, ListDataset, epoch_batches, load_corpus
 from .diagnostics import effective_rank, geometry_agreement, mean_pairwise_cosine, teacher_cosine
 from .eval.sts import evaluate_sts, load_sts_pairs, make_student_encode_fn
@@ -94,6 +95,7 @@ def run_training(
     logger: Optional[MetricsLogger] = None,
     sts_data: Optional[tuple[list[str], list[str], list[float]]] = None,
     resume: bool = True,
+    retrieval_val: Optional[dict[str, list[str]]] = None,
 ) -> dict[str, Any]:
     run_dir = Path(run_dir)
     ckpt_dir = run_dir / "checkpoints"
@@ -137,8 +139,21 @@ def run_training(
     def diagnostics() -> dict[str, float]:
         return run_diagnostics(model, collator, val_idx, device, sts_fn=sts_fn)
 
+    retrieval_fn = None
+    if retrieval_val is not None:
+        # Same metric and prefix as the contrastive runs ("val/mrr@10", ...), so all methods are comparable.
+        encode_q = make_student_encode_fn(model, tokenizer, device, cfg.eval.query_max_length)
+        encode_p = make_student_encode_fn(model, tokenizer, device, cfg.student.max_length, batch_size=64)
+        retrieval_fn = torch.no_grad()(lambda: evaluate_retrieval(encode_q, encode_p, retrieval_val))
+
+    def log_validation(at_step: int) -> None:
+        logger.log(at_step, diagnostics(), prefix="diag/")
+        if retrieval_fn is not None:
+            logger.log(at_step, retrieval_fn(), prefix="val/")
+            model.train()  # the encode functions switch back, but be explicit
+
     if step == 0:
-        logger.log(0, diagnostics(), prefix="diag/")
+        log_validation(0)
 
     use_amp = bool(t.bf16 and device.type == "cuda")
     model.train()
@@ -197,7 +212,7 @@ def run_training(
                 logger.log(step, record, prefix="train/")
                 window, window_count, window_start = {}, 0, time.time()
             if step % t.diag_every == 0 or step == t.max_steps:
-                logger.log(step, diagnostics(), prefix="diag/")
+                log_validation(step)
             if step % t.ckpt_every == 0:
                 save(step)
                 last_saved = step
@@ -246,9 +261,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         except Exception as exc:
             warnings.warn(f"STS monitoring disabled: {exc}")
 
+    retrieval_val = load_pairs(cfg.eval.pairs_val) if cfg.eval.pairs_val else None
+
     print(f"run dir: {run_dir}", flush=True)
     result = run_training(
-        cfg, run_dir, model, tokenizer, texts, caches, get_device(), sts_data=sts_data, resume=not args.no_resume
+        cfg, run_dir, model, tokenizer, texts, caches, get_device(), sts_data=sts_data, resume=not args.no_resume,
+        retrieval_val=retrieval_val,
     )
     print(result, flush=True)
 

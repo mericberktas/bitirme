@@ -78,3 +78,22 @@ def test_resume_continues_from_last_checkpoint(experiment, tmp_path):
     assert sum(1 for r in records if r["step"] == 0) == 1
     assert max(r["step"] for r in records if "train/total" in r) == 6
     assert [s for s, _ in list_checkpoints(run_dir / "checkpoints")] == [3, 6]
+
+
+def test_validation_retrieval_is_logged_like_the_contrastive_runs(experiment, tmp_path):
+    texts = make_texts(120)
+    model, caches = build(experiment, texts)
+    val_texts = make_texts(30)[10:]
+    val = {"question": [t[:25] for t in val_texts], "passage": val_texts, "passage_id": [f"p{i}" for i in range(len(val_texts))]}
+    run_dir = tmp_path / "run"
+    run_training(experiment, run_dir, model, CharTokenizer(), texts, caches, torch.device("cpu"), retrieval_val=val)
+    records = read_metrics(run_dir / "metrics.jsonl")
+    steps = [r["step"] for r in records if "val/mrr@10" in r]
+    assert steps == [0, 3, 6]  # the same cadence as the diagnostics
+    last = next(r for r in records if r["step"] == 6 and "val/mrr@10" in r)
+    assert 0.0 < last["val/mrr@10"] <= 1.0 and last["val/num_passages"] == 20
+
+    plain_run = tmp_path / "plain"
+    model2, caches2 = build(experiment, texts)
+    run_training(experiment, plain_run, model2, CharTokenizer(), texts, caches2, torch.device("cpu"))
+    assert not any("val/mrr@10" in r for r in read_metrics(plain_run / "metrics.jsonl"))

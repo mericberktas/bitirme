@@ -88,6 +88,10 @@ class EvalConfig:
     sts_dataset: Optional[str] = None
     sts_split: str = "validation"
     sts_columns: Optional[list[str]] = None  # [sentence1, sentence2, score]
+    # Optional validation retrieval (the same metric the contrastive runs log, so the methods are comparable):
+    # a pairs JSONL written by prepare_pairs. Passages are encoded with student.max_length.
+    pairs_val: Optional[str] = None
+    query_max_length: int = 64
 
 
 @dataclass
@@ -158,11 +162,15 @@ def parse_override_value(text: str) -> Any:
     return value
 
 
-def _set_dotted(d: dict[str, Any], dotted: str, value: Any) -> None:
+def _set_dotted(d: Any, dotted: str, value: Any) -> None:
+    """Set `a.b.c` in nested dicts; a numeric part indexes a list (`teachers.0.weight`)."""
     parts = dotted.split(".")
     for p in parts[:-1]:
-        d = d.setdefault(p, {})
-    d[parts[-1]] = value
+        d = d[int(p)] if isinstance(d, list) else d.setdefault(p, {})
+    if isinstance(d, list):
+        d[int(parts[-1])] = value
+    else:
+        d[parts[-1]] = value
 
 
 def load_config(path: str | Path, overrides: Optional[list[str]] = None) -> ExperimentConfig:

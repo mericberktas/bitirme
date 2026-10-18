@@ -1,0 +1,66 @@
+# Stage 1, baseline 2: single-teacher distillation from Qwen3-Embedding-8B on the stage-1 texts (the questions
+# and passages of the three QA datasets, prepared by `prepare_pairs`). Compared against the contrastive baseline
+# and the two-teacher run under the same student, the same texts and a matched budget; every run is scored with
+# the same validation retrieval metric (val/mrr@10) on pairs_val.jsonl.
+#
+# Budget: 1800 steps x 128 texts = ~230K texts seen, about what the contrastive runs see (3 epochs x 38.7K pairs
+# x 2 texts). Learning rate and the loss weights are carried over from the Cosmos configs, not tuned.
+
+name: stage1_single_qwen3_8b
+output_dir: /content/drive/MyDrive/bitirme/runs
+local_tmp_dir: /content/ckpt_staging
+tensorboard: true
+
+teachers:
+  - name: qwen3_8b
+    hf_id: Qwen/Qwen3-Embedding-8B
+    revision: 1d8ad4ca9b3dd8059ad90a75d4983776a23d44af
+    dim: 4096
+    doc_prefix: ""
+    max_length: 512
+    batch_size: 32
+    dtype: bfloat16
+    weight: 1.0
+
+student:
+  hf_id: ytu-ce-cosmos/modernbert-tr-base-1k
+  revision: c2e35f553101cce5b03fbb318ef8728473fd34dd
+  max_length: 512
+  pooling: mean
+
+data:
+  corpus_path: /content/drive/MyDrive/bitirme/data/stage1/corpus_train.jsonl
+  text_column: text
+  cache_dir: /content/drive/MyDrive/bitirme/cache/teachers   # cache folders are keyed by the corpus fingerprint
+  shard_size: 10000
+  max_samples: null          # use all stage-1 texts
+  min_chars: 10              # prepare_pairs keeps questions of 10+ characters; the default 20 would drop some
+  val_size: 2000
+
+loss:
+  cosine_weight: 10.0
+  sim_weight: 200.0
+  resim_weight: 20.0
+  resim_margin: 0.015
+  resim_num_samples: 4096
+  gor_weight: 0.0
+
+train:
+  batch_size: 128
+  lr: 5.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_steps: 1800
+  grad_clip: 1.0
+  bf16: true
+  seed: 42
+  num_workers: 2
+  log_every: 25
+  diag_every: 300
+  ckpt_every: 300
+  keep_last: 2
+
+eval:
+  sts_dataset: null
+  pairs_val: /content/drive/MyDrive/bitirme/data/stage1/pairs_val.jsonl   # val/mrr@10, same as the contrastive runs
+  query_max_length: 64
