@@ -17,6 +17,8 @@ import hashlib
 import json
 import math
 import os
+import socket
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -42,6 +44,61 @@ def cache_dir_for(cache_root: str | Path, teacher: TeacherConfig, fingerprint: s
 
 def _shard_path(directory: Path, shard: int) -> Path:
     return directory / f"shard_{shard:05d}.npy"
+
+
+# A lock file stops two sessions (e.g. two Colab notebooks) from encoding the same teacher into the same cache
+# at once, which would waste a GPU. It is refreshed after every shard and ignored once it is older than the
+# timeout, so a crashed session does not block the cache for long. Shards are written atomically, so the lock is
+# a courtesy, not what keeps the cache intact; note that Drive may show a new file to another session late.
+LOCK_NAME = "encoding.lock"
+LOCK_TIMEOUT_S = 3600.0  # longer than one shard of the slowest teacher (Qwen3-8B: ~26 min per 10K texts on an L4)
+
+
+def _acquire_lock(directory: Path, teacher: TeacherConfig, timeout_s: float, ignore: bool) -> Path:
+    lock = directory / LOCK_NAME
+    if lock.exists() and not ignore:
+        age = time.time() - lock.stat().st_mtime
+        if age < timeout_s:
+            try:
+                holder = json.loads(lock.read_text(encoding="utf-8")).get("host", "unknown")
+            except (OSError, ValueError):
+                holder = "unknown"
+            raise RuntimeError(
+                f"teacher {teacher.name}: another session (host {holder}) is encoding into {directory}; its lock was "
+                f"refreshed {age / 60:.0f} min ago. Wait for it, or pass --ignore-lock if that session is dead."
+            )
+    lock.write_text(json.dumps({"host": socket.gethostname(), "pid": os.getpid(), "started": time.time()}), encoding="utf-8")
+    return lock
+
+
+def _touch_lock(lock: Path) -> None:
+    try:
+        os.utime(lock)
+    except OSError:
+        pass
+
+
+def _release_lock(lock: Path) -> None:
+    try:
+        lock.unlink()
+    except OSError:
+        pass
+
+
+def cache_status(teacher: TeacherConfig, cache_root: str | Path, fingerprint: str, n_texts: int, shard_size: int) -> dict:
+    """How far a teacher's cache for this corpus is (file existence only; shard contents are not validated)."""
+    directory = cache_dir_for(cache_root, teacher, fingerprint)
+    num_shards = math.ceil(n_texts / shard_size)
+    done = sum(1 for shard in range(num_shards) if _shard_path(directory, shard).exists())
+    lock = directory / LOCK_NAME
+    return {
+        "teacher": teacher.name,
+        "directory": str(directory),
+        "shards_done": done,
+        "num_shards": num_shards,
+        "complete": (directory / "meta.json").exists() and done == num_shards,
+        "lock_age_s": (time.time() - lock.stat().st_mtime) if lock.exists() else None,
+    }
 
 
 def _normalize(x: np.ndarray) -> np.ndarray:
@@ -94,6 +151,8 @@ def encode_teacher(
     encode_fn: Optional[EncodeFn] = None,
     fingerprint: Optional[str] = None,
     verbose: bool = True,
+    lock_timeout_s: float = LOCK_TIMEOUT_S,
+    ignore_lock: bool = False,
 ) -> Path:
     """Encode `texts` with one teacher into the shard cache. Resumable."""
     fingerprint = fingerprint or corpus_fingerprint(texts)
@@ -112,10 +171,11 @@ def encode_teacher(
                 f"now shard_size={shard_size}. Use the old value or delete that directory."
             )
 
+    lock = _acquire_lock(directory, teacher, lock_timeout_s, ignore_lock)
     close = lambda: None  # noqa: E731
-    if encode_fn is None:
-        encode_fn, close = make_sentence_transformer_encoder(teacher)
     try:
+        if encode_fn is None:
+            encode_fn, close = make_sentence_transformer_encoder(teacher)
         for shard in range(num_shards):
             path = _shard_path(directory, shard)
             lo, hi = shard * shard_size, min((shard + 1) * shard_size, len(texts))
@@ -144,10 +204,12 @@ def encode_teacher(
             with open(tmp, "wb") as f:
                 np.save(f, vectors.astype(np.float16))
             os.replace(tmp, path)
+            _touch_lock(lock)
             if verbose:
                 print(f"[{teacher.name}] shard {shard + 1}/{num_shards} done", flush=True)
     finally:
         close()
+        _release_lock(lock)
 
     meta = {
         "teacher": teacher.name,
