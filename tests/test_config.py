@@ -79,10 +79,18 @@ def test_every_config_in_the_repo_loads_and_stage1_configs_share_the_data_and_bu
     for path in sorted(root.glob("*.yaml")):
         loaded[path.stem] = (load_contrastive_config if path.stem.startswith("contrastive") else load_config)(path)
     assert {"stage1_single_qwen3_8b", "stage1_single_bge_m3", "stage1_two_qwen3_8b_bge_m3", "contrastive_mnrl"} <= set(loaded)
-    stage1 = [loaded[n] for n in ("stage1_single_qwen3_8b", "stage1_single_bge_m3", "stage1_two_qwen3_8b_bge_m3")]
+    stage1 = [c for n, c in loaded.items() if n.startswith("stage1_")]
+    assert len(stage1) >= 5
     assert len({(c.data.corpus_path, c.data.min_chars, c.data.max_samples, c.train.max_steps, c.train.batch_size,
                  c.train.lr, c.eval.pairs_val) for c in stage1}) == 1  # only the teacher list differs
-    assert [t.name for t in stage1[2].teachers] == ["bge_m3", "qwen3_8b"]
+    assert [t.name for t in loaded["stage1_two_qwen3_8b_bge_m3"].teachers] == ["bge_m3", "qwen3_8b"]
+    assert [t.name for t in loaded["stage1_two_bge_m3_me5"].teachers] == ["bge_m3", "me5_large_instruct"]
+    # the same teacher must be defined identically everywhere, or its cache (keyed by teacher name) would not match
+    definitions = {}
+    for cfg in loaded.values():
+        for t in getattr(cfg, "teachers", []):
+            key = (t.hf_id, t.revision, t.dim, t.doc_prefix, t.max_length, t.dtype)
+            assert definitions.setdefault(t.name, key) == key, f"teacher {t.name} is defined differently in two configs"
     # the contrastive runs read the very same validation pairs
     assert loaded["contrastive_mnrl"].data.pairs_val == stage1[0].eval.pairs_val
 

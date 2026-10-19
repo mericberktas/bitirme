@@ -1,0 +1,77 @@
+# Stage 1: two teachers of the same size class, BGE-M3 and multilingual-e5-large-instruct, equal weights.
+# In our own TR-MTEB scores mE5 beats BGE-M3 on 17 of 26 tasks (STS, QA retrieval, news classification) and BGE-M3
+# leads on NLI and sentiment; taking the better teacher per task gives 68.58 (best single teacher: 67.51), a smaller
+# headroom than BGE-M3 + Qwen3-8B (69.40) but with a teacher the student can imitate more closely. These oracle
+# numbers are an upper bound, not an expected result.
+#   teachers.0 = bge_m3     teachers.1 = me5_large_instruct
+# Weights (`--override teachers.0.weight=2`) work as in stage1_two_qwen3_8b_bge_m3.yaml. Everything but the teacher
+# list is identical to the other stage-1 configs; the BGE-M3 and mE5 vectors are cached per teacher and shared.
+
+name: stage1_two_bge_m3_me5
+output_dir: /content/drive/MyDrive/bitirme/runs
+local_tmp_dir: /content/ckpt_staging
+tensorboard: true
+
+teachers:
+  - name: bge_m3
+    hf_id: BAAI/bge-m3
+    revision: 5617a9f61b028005a4858fdac845db406aefb181
+    dim: 1024
+    doc_prefix: ""
+    max_length: 512
+    batch_size: 64
+    dtype: float16
+    weight: 1.0
+  - name: me5_large_instruct
+    hf_id: intfloat/multilingual-e5-large-instruct
+    revision: 274baa43b0e13e37fafa6428dbc7938e62e5c439
+    dim: 1024
+    doc_prefix: ""
+    max_length: 512
+    batch_size: 64
+    dtype: float16
+    weight: 1.0
+
+student:
+  hf_id: ytu-ce-cosmos/modernbert-tr-base-1k
+  revision: c2e35f553101cce5b03fbb318ef8728473fd34dd
+  max_length: 512
+  pooling: mean
+
+data:
+  corpus_path: /content/drive/MyDrive/bitirme/data/stage1/corpus_train.jsonl
+  text_column: text
+  cache_dir: /content/drive/MyDrive/bitirme/cache/teachers
+  shard_size: 10000
+  max_samples: null
+  min_chars: 10
+  val_size: 2000
+
+loss:
+  cosine_weight: 10.0
+  sim_weight: 200.0
+  resim_weight: 20.0
+  resim_margin: 0.015
+  resim_num_samples: 4096
+  gor_weight: 0.0
+
+train:
+  batch_size: 128
+  chunk_size: 32             # gradient caching: same maths, memory of 32 texts (null ran out of memory on an L4)
+  lr: 5.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_steps: 1800
+  grad_clip: 1.0
+  bf16: true
+  seed: 42
+  num_workers: 2
+  log_every: 25
+  diag_every: 300
+  ckpt_every: 300
+  keep_last: 2
+
+eval:
+  sts_dataset: null
+  pairs_val: /content/drive/MyDrive/bitirme/data/stage1/pairs_val.jsonl
+  query_max_length: 64
