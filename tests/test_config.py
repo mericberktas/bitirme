@@ -76,8 +76,12 @@ def test_every_config_in_the_repo_loads_and_stage1_configs_share_the_data_and_bu
 
     root = Path(__file__).resolve().parent.parent / "configs"
     loaded = {}
+    from turkish_distill.build_mix import load_mix_config
+
+    loaders = {"contrastive": load_contrastive_config, "data_mix": load_mix_config}  # by file name prefix
     for path in sorted(root.glob("*.yaml")):
-        loaded[path.stem] = (load_contrastive_config if path.stem.startswith("contrastive") else load_config)(path)
+        loader = next((fn for prefix, fn in loaders.items() if path.stem.startswith(prefix)), load_config)
+        loaded[path.stem] = loader(path)
     assert {"stage1_single_qwen3_8b", "stage1_single_bge_m3", "stage1_two_qwen3_8b_bge_m3", "contrastive_mnrl"} <= set(loaded)
     stage1 = [c for n, c in loaded.items() if n.startswith("stage1_")]
     assert len(stage1) >= 5
@@ -93,6 +97,23 @@ def test_every_config_in_the_repo_loads_and_stage1_configs_share_the_data_and_bu
             assert definitions.setdefault(t.name, key) == key, f"teacher {t.name} is defined differently in two configs"
     # the contrastive runs read the very same validation pairs
     assert loaded["contrastive_mnrl"].data.pairs_val == stage1[0].eval.pairs_val
+
+
+def test_the_data_mix_ablation_arms_differ_from_the_stage1_bge_run_only_in_the_corpus():
+    import dataclasses
+    from pathlib import Path
+
+    from turkish_distill.config import load_config
+
+    root = Path(__file__).resolve().parent.parent / "configs"
+    base = load_config(root / "stage1_single_bge_m3.yaml")
+    for name in ("mixabl_bge_cosmos70k", "mixabl_bge_mix70k"):
+        arm = load_config(root / f"{name}.yaml")
+        assert (arm.teachers, arm.student, arm.loss, arm.train, arm.eval) == (base.teachers, base.student, base.loss, base.train, base.eval), name
+        differing = {f.name for f in dataclasses.fields(arm.data) if getattr(arm.data, f.name) != getattr(base.data, f.name)}
+        assert differing <= {"corpus_path", "max_samples"}, (name, differing)
+    assert load_config(root / "mixabl_bge_cosmos70k.yaml").data.max_samples == 70000  # same text budget as the stage-1 corpus
+    assert load_config(root / "mixabl_bge_mix70k.yaml").data.corpus_path.endswith("mix/mix_v1.jsonl")
 
 
 def test_list_index_overrides_set_teacher_weights(tmp_path):

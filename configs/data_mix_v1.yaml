@@ -1,0 +1,45 @@
+# Distillation corpus mix, version 1 (70,000 texts, the size of the stage-1 corpus).
+#
+# Why a mix: the stage-1 texts are one genre (Wikipedia/history QA, 62% LLM-written questions) and the Cosmos chunks
+# are long (median 1,492 characters, cut at 1,500) while most TR-MTEB texts are short: median characters per skill
+# group: NLI 53, STS 48, pragmatic 85, bitext 101, sentiment 152, hard retrieval 188, topic 214, QA retrieval 83,
+# clustering 1,089. The shares below are a HYPOTHESIS about a good composition, not an optimum: they are to be
+# tested by an ablation (same teacher, same number of texts and steps) against the stage-1 texts and a random
+# Cosmos sample.
+#
+# Build (CPU): python -m turkish_distill.build_mix --config configs/data_mix_v1.yaml --forbidden <benchmark_texts.jsonl> --out <mix_v1.jsonl>
+
+name: mix_v1
+seed: 42
+target_total: 70000
+oversample: 1.5          # candidates kept per bucket = 1.5 x quota; room for duplicates and benchmark copies
+
+sources:
+  cosmos:                # the decontaminated Cosmos chunks (decontaminate_corpus); web text: news, forums, shops, wiki-like pages
+    type: jsonl
+    path: /content/drive/MyDrive/bitirme/data/corpus_clean.jsonl
+  qa:                    # prepare_pairs output of the three QA datasets
+    type: pairs
+    path: /content/drive/MyDrive/bitirme/data/stage1/pairs_train.jsonl
+
+buckets:
+  # short, well-formed sentences: NLI, STS, sentiment, offensive/irony, bitext
+  - {name: short_sentences, source: cosmos, transform: sentences, share: 0.32, min_chars: 30, max_chars: 150}
+  # paragraph-sized lines of web text: topic classification, QA passages
+  - {name: cosmos_paragraphs, source: cosmos, transform: lines, share: 0.22, min_chars: 150, max_chars: 600}
+  # first-person / conversational / review-like segments (keyword heuristic): sentiment, pragmatic
+  - name: informal_segments
+    source: cosmos
+    transform: lines
+    share: 0.13
+    min_chars: 50
+    max_chars: 400
+    include_regex: '\b(arkadaşlar|merhaba|selam|teşekkürler|teşekkür ederim|bence|sizce|acaba|sorunum|tavsiye|şikayet|memnun|berbat|harika|kesinlikle|yardımcı olur musunuz)\b'
+  # whole long chunks: clustering, long retrieval documents
+  - {name: long_chunks, source: cosmos, transform: whole, share: 0.08, min_chars: 800, max_chars: 1500}
+  # questions: retrieval queries
+  - {name: questions, source: qa, transform: questions, share: 0.10, min_chars: 15, max_chars: 200}
+  # encyclopedic articles (Wikipedia) and introductions of Wikipedia articles from science, technology and social-science
+  # categories (WikiRAG-TR): well-formed passages, hard retrieval
+  - {name: wiki_articles, source: qa, transform: passages, where_source: [wikiqa], share: 0.08, min_chars: 150, max_chars: 1200}
+  - {name: wikirag_intros, source: qa, transform: passages, where_source: [wikirag], share: 0.07, min_chars: 150, max_chars: 1200, allow_shortfall: true}
