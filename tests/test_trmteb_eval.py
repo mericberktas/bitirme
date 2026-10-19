@@ -274,10 +274,22 @@ class _FakeEnv:
                 for name in names:
                     write_result(Path(output_folder) / "inner" / "rev", name, 0.6)
 
-        class FakeST:
-            def __init__(self, name, **kwargs):
-                env.loaded.append(name)
+        class Normalize:  # stands for sentence_transformers.models.Normalize
+            pass
 
+        env.Normalize = Normalize
+        env.initial_modules: list = []  # modules a "loaded" model already has (set by a test)
+        env.model = None
+
+        class FakeST(list):  # a SentenceTransformer is a sequence of modules
+            def __init__(self, name, **kwargs):
+                super().__init__(env.initial_modules)
+                env.loaded.append(name)
+                env.model = self
+
+        fake_models = types.ModuleType("sentence_transformers.models")
+        fake_models.Normalize = Normalize
+        monkeypatch.setitem(sys.modules, "sentence_transformers.models", fake_models)
         fake_mteb = types.ModuleType("mteb")
         fake_mteb.get_benchmark = lambda n: FakeBenchmark()
         fake_mteb.get_tasks = lambda tasks, languages=None: [types.SimpleNamespace(name=t) for t in tasks]
@@ -332,3 +344,25 @@ def test_changing_dtype_for_an_existing_label_is_refused(tmp_path, monkeypatch):
     trmteb.run_evaluation("a/b", tmp_path, label="m", dtype="float16")
     with pytest.raises(ValueError, match="different protocol"):
         trmteb.run_evaluation("a/b", tmp_path, label="m", dtype="float32")
+
+
+def test_normalize_adds_a_normalize_layer_once_and_is_part_of_the_protocol(tmp_path, monkeypatch):
+    env = _FakeEnv(monkeypatch)
+    trmteb.run_evaluation("a/b", tmp_path, label="plain", normalize=False)
+    assert not any(isinstance(m, env.Normalize) for m in env.model)  # a trained student is left as it is by default
+
+    trmteb.run_evaluation("a/b", tmp_path, label="norm", normalize=True)
+    assert [type(m) for m in env.model] == [env.Normalize]
+    assert json.loads((tmp_path / "norm" / "run_info.json").read_text())["normalize"] is True
+
+    env.initial_modules = [env.Normalize()]  # a packaged model that already normalises
+    trmteb.run_evaluation("c/d", tmp_path, label="packaged", normalize=True)
+    assert sum(isinstance(m, env.Normalize) for m in env.model) == 1
+
+    with pytest.raises(ValueError):  # results with and without normalisation must never share a label
+        trmteb.run_evaluation("a/b", tmp_path, label="plain", normalize=True)
+
+
+def test_scale_sensitive_tasks_are_the_classification_and_clustering_tasks():
+    assert len(trmteb.SCALE_SENSITIVE_TASKS) == 10
+    assert {TASK_CATEGORIES[t] for t in trmteb.SCALE_SENSITIVE_TASKS} == {"Classification", "Clustering"}

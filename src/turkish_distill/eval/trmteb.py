@@ -84,7 +84,11 @@ TASK_GROUPS: dict[str, list[str]] = {
     "Clustering": ["TurkishAbstractCorpusClustering", "TurkishColumnWritingClustering"],
     "Bitext": ["WMT16BitextMining"],
 }
+# Tasks whose score depends on the scale of the embeddings (a logistic regression / k-means is fitted on the raw
+# vectors); retrieval, STS and pair classification use cosine similarity and do not.
+SCALE_SENSITIVE_CATEGORIES = ("Classification", "Clustering")
 CATEGORY_ORDER = ["Retrieval", "Classification", "Clustering", "PairClassification", "STS", "BitextMining"]
+SCALE_SENSITIVE_TASKS = [t for t, c in TASK_CATEGORIES.items() if c in SCALE_SENSITIVE_CATEGORIES]
 _SPLIT_PREFERENCE = ("test", "validation", "dev", "train")
 _IGNORED_FILES = {"model_meta.json", "summary.json", "run_info.json"}
 
@@ -312,7 +316,7 @@ def prepare_reuse(
     return reused, remaining
 
 
-_RUN_PROTOCOL_KEYS = ("model", "revision", "dtype", "max_seq_length", "prompts")
+_RUN_PROTOCOL_KEYS = ("model", "revision", "dtype", "max_seq_length", "prompts", "normalize")
 
 
 def check_label_protocol(label_dir: str | Path, protocol: dict, overwrite: bool = False) -> None:
@@ -361,6 +365,7 @@ def run_evaluation(
     overwrite: bool = False,
     verbosity: int = 1,
     reuse_from: Optional[str] = None,
+    normalize: bool = False,
 ) -> Path:
     """Evaluate one model on TR-MTEB. Returns the label directory holding the results.
 
@@ -411,7 +416,8 @@ def run_evaluation(
 
     check_label_protocol(
         label_dir,
-        {"model": model, "revision": revision, "dtype": dtype, "max_seq_length": max_seq_length, "prompts": prompts},
+        {"model": model, "revision": revision, "dtype": dtype, "max_seq_length": max_seq_length, "prompts": prompts,
+         "normalize": normalize},
         overwrite,
     )
 
@@ -432,6 +438,7 @@ def run_evaluation(
         "prompts": prompts,
         "dtype": dtype,
         "max_seq_length": max_seq_length,
+        "normalize": normalize,
         "batch_size": batch_size,
         "device": device,
         "reused_from": reuse_from,
@@ -459,6 +466,13 @@ def run_evaluation(
         )
         if max_seq_length:
             st_model.max_seq_length = max_seq_length
+        if normalize:
+            # A folder saved by `save_backbone` is loaded as transformer + mean pooling only, so its vectors are
+            # not unit length; published embedding models (BGE-M3, mE5, Qwen3) ship a Normalize layer.
+            from sentence_transformers.models import Normalize
+
+            if not any(isinstance(module, Normalize) for module in st_model):
+                st_model.append(Normalize())
         st_model.prompts = prompts
         st_model.default_prompt_name = None
         tasks = benchmark if len(tasks_to_run) == len(TASK_CATEGORIES) else mteb.get_tasks(tasks=tasks_to_run, languages=["tur"])
