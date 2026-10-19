@@ -127,3 +127,19 @@ def test_list_index_overrides_set_teacher_weights(tmp_path):
     assert cfg.train.lr == pytest.approx(3e-5)
     with pytest.raises(IndexError):
         load_config(path, ["teachers.5.weight=1"])
+
+
+def test_the_loss_ablation_arms_differ_from_the_stage1_bge_run_only_in_the_loss_weights():
+    from pathlib import Path
+
+    from turkish_distill.config import load_config
+
+    root = Path(__file__).resolve().parent.parent / "configs"
+    base = load_config(root / "stage1_single_bge_m3.yaml")
+    expected = {"ablloss_bge_vector_only": (10.0, 0.0, 0.0), "ablloss_bge_relation_only": (0.0, 200.0, 20.0)}
+    for name, (cos, sim, resim) in expected.items():
+        arm = load_config(root / f"{name}.yaml")
+        assert (arm.teachers, arm.student, arm.data, arm.train, arm.eval) == (base.teachers, base.student, base.data, base.train, base.eval), name
+        assert (arm.loss.cosine_weight, arm.loss.sim_weight, arm.loss.resim_weight) == (cos, sim, resim)
+        assert (arm.loss.resim_margin, arm.loss.resim_num_samples, arm.loss.gor_weight) == (base.loss.resim_margin, base.loss.resim_num_samples, base.loss.gor_weight)
+    assert (base.loss.cosine_weight, base.loss.sim_weight, base.loss.resim_weight) == (10.0, 200.0, 20.0)  # the mixed reference

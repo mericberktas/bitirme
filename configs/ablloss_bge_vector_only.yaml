@@ -1,0 +1,66 @@
+# Loss ablation, arm "vector only": BGE-M3 single-teacher distillation with ONLY the vector term
+# (per-teacher projection of the student embedding matched to the teacher vector, cosine_weight 10) and no
+# relation terms (sim_weight 0, resim_weight 0). Everything else is identical to stage1_single_bge_m3.yaml
+# (mixed loss: 10 / 200 / 20; 62.72 on TR-MTEB there), so the difference isolates what the relation terms add.
+# Arms: stage1_single_bge_m3 (mixed), this one, ablloss_bge_relation_only.
+# The BGE-M3 vectors of the stage-1 corpus are already cached (no encoding needed).
+
+name: ablloss_bge_vector_only
+output_dir: /content/drive/MyDrive/bitirme/runs
+local_tmp_dir: /content/ckpt_staging
+tensorboard: true
+
+teachers:
+  - name: bge_m3
+    hf_id: BAAI/bge-m3
+    revision: 5617a9f61b028005a4858fdac845db406aefb181
+    dim: 1024
+    doc_prefix: ""
+    max_length: 512
+    batch_size: 64
+    dtype: float16
+    weight: 1.0
+
+student:
+  hf_id: ytu-ce-cosmos/modernbert-tr-base-1k
+  revision: c2e35f553101cce5b03fbb318ef8728473fd34dd
+  max_length: 512
+  pooling: mean
+
+data:
+  corpus_path: /content/drive/MyDrive/bitirme/data/stage1/corpus_train.jsonl
+  text_column: text
+  cache_dir: /content/drive/MyDrive/bitirme/cache/teachers
+  shard_size: 10000
+  max_samples: null
+  min_chars: 10
+  val_size: 2000
+
+loss:
+  cosine_weight: 10.0
+  sim_weight: 0.0            # relation terms off
+  resim_weight: 0.0
+  resim_margin: 0.015
+  resim_num_samples: 4096
+  gor_weight: 0.0
+
+train:
+  batch_size: 128
+  chunk_size: 32             # gradient caching: same maths, memory of 32 texts (null ran out of memory on an L4)
+  lr: 5.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_steps: 1800
+  grad_clip: 1.0
+  bf16: true
+  seed: 42
+  num_workers: 2
+  log_every: 25
+  diag_every: 300
+  ckpt_every: 300
+  keep_last: 2
+
+eval:
+  sts_dataset: null
+  pairs_val: /content/drive/MyDrive/bitirme/data/stage1/pairs_val.jsonl
+  query_max_length: 64

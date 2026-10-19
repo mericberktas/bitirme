@@ -138,3 +138,22 @@ def test_a_phased_in_teacher_ramps_up_during_training_and_is_logged(experiment, 
     ramp = [r["train/weight/t_big"] for r in train]  # means over steps (0,1), (2,3), (4,5) of 0, 1/3, 2/3, ... * 2
     assert ramp == sorted(ramp) and 0.0 < ramp[0] < ramp[-1] < 2.0
     assert all(r["train/weight/t_small"] == 1.0 for r in train)
+
+
+def test_training_runs_with_only_the_vector_term_or_only_the_relation_terms(experiment, tmp_path):
+    texts = make_texts(120)
+    results = {}
+    for name, weights in {"vector": (10.0, 0.0, 0.0), "relation": (0.0, 200.0, 20.0)}.items():
+        exp = copy.deepcopy(experiment)
+        exp.loss.cosine_weight, exp.loss.sim_weight, exp.loss.resim_weight = weights
+        model, caches = build(exp, texts)
+        heads_before = {k: v.clone() for k, v in model.heads.state_dict().items()}
+        run_dir = tmp_path / name
+        run_training(exp, run_dir, model, CharTokenizer(), texts, caches, torch.device("cpu"))
+        train = [r for r in read_metrics(run_dir / "metrics.jsonl") if "train/total" in r]
+        assert all(torch.isfinite(torch.tensor(r["train/total"])) for r in train)
+        heads_changed = any(not torch.equal(heads_before[k], v) for k, v in model.heads.state_dict().items())
+        results[name] = (heads_changed, set(k.split("/")[1] for r in train for k in r if k.startswith("train/") and "/" in k[6:]))
+    assert results["vector"][0] is True and results["relation"][0] is False  # no vector term, no gradient to the heads
+    assert "cos" in results["vector"][1] and "sim" not in results["vector"][1] and "resim" not in results["vector"][1]
+    assert "cos" not in results["relation"][1] and {"sim", "resim"} <= results["relation"][1]
