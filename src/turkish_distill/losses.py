@@ -26,11 +26,49 @@ def cosine_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return (1.0 - (pred * target).sum(dim=-1)).mean()
 
 
-def similarity_loss(student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
-    """MSE between the in-batch cosine-similarity matrices of student and teacher."""
+def offdiag_similarities(vectors: torch.Tensor) -> torch.Tensor:
+    """Cosine similarities of all distinct pairs in a batch (upper triangle, row-major order)."""
+    v = F.normalize(vectors.float(), dim=-1)
+    n = v.shape[0]
+    iu = torch.triu_indices(n, n, offset=1, device=v.device)
+    return (v @ v.T)[iu[0], iu[1]]
+
+
+def zscore(values: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Mean 0 and (population) std 1; the MSE of two z-scored vectors is 2 * (1 - Pearson correlation)."""
+    centred = values - values.mean()
+    return centred / (centred.pow(2).mean().sqrt() + eps)
+
+
+def similarity_loss(student: torch.Tensor, teacher: torch.Tensor, standardize: bool = False) -> torch.Tensor:
+    """MSE between the in-batch cosine-similarity matrices of student and teacher.
+
+    With `standardize` the off-diagonal entries of both matrices are z-scored first (method b), so only the
+    pattern of which pairs are more similar than others is matched, not the offset or the scale.
+    """
+    if standardize:
+        return F.mse_loss(zscore(offdiag_similarities(student)), zscore(offdiag_similarities(teacher)))
     s = F.normalize(student.float(), dim=-1)
     t = F.normalize(teacher.float(), dim=-1)
     return F.mse_loss(s @ s.T, t @ t.T)
+
+
+def ranking_hinge(
+    student_pairs: torch.Tensor,
+    teacher_pairs: torch.Tensor,
+    margin: float,
+    num_samples: int,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """Pair-of-pairs hinge on similarity vectors (one entry per text pair); only the teacher's order is used."""
+    num_pairs = student_pairs.shape[0]
+    a = torch.randint(0, num_pairs, (num_samples,), device=student_pairs.device, generator=generator)
+    b = torch.randint(0, num_pairs, (num_samples,), device=student_pairs.device, generator=generator)
+    teacher_prefers_a = teacher_pairs[a] > teacher_pairs[b]
+    if not bool(teacher_prefers_a.any()):
+        return student_pairs.sum() * 0.0
+    violation = F.relu(student_pairs[b] - student_pairs[a] + margin)
+    return violation[teacher_prefers_a].mean()
 
 
 def relative_similarity_loss(
@@ -46,20 +84,9 @@ def relative_similarity_loss(
     similar than pair b, the student must too, by at least `margin`. Sampling
     keeps the cost linear in `num_samples` instead of quadratic in batch pairs.
     """
-    s = F.normalize(student.float(), dim=-1)
-    t = F.normalize(teacher.float(), dim=-1)
-    batch = s.shape[0]
-    iu = torch.triu_indices(batch, batch, offset=1, device=s.device)
-    sp = (s @ s.T)[iu[0], iu[1]]
-    tp = (t @ t.T)[iu[0], iu[1]]
-    num_pairs = sp.shape[0]
-    a = torch.randint(0, num_pairs, (num_samples,), device=s.device, generator=generator)
-    b = torch.randint(0, num_pairs, (num_samples,), device=s.device, generator=generator)
-    teacher_prefers_a = tp[a] > tp[b]
-    if not bool(teacher_prefers_a.any()):
-        return sp.sum() * 0.0
-    violation = F.relu(sp[b] - sp[a] + margin)
-    return violation[teacher_prefers_a].mean()
+    return ranking_hinge(
+        offdiag_similarities(student), offdiag_similarities(teacher), margin, num_samples, generator
+    )
 
 
 def gor_loss(emb: torch.Tensor) -> torch.Tensor:
@@ -116,6 +143,8 @@ class MultiTeacherLoss(nn.Module):
         weight_sum = sum(weights.values())
         if weight_sum <= 0:
             raise ValueError(f"sum of teacher weights is not positive at step {self._step}")
+        shared = cfg.relation_mode == "shared"
+        shared_gram = None  # (c): the weighted average of the teachers' z-scored Gram vectors
         for name, weight in weights.items():
             logs[f"weight/{name}"] = weight
             if weight == 0.0:
@@ -126,21 +155,38 @@ class MultiTeacherLoss(nn.Module):
                 c = cosine_loss(projections[name], target)
                 parts = parts + cfg.cosine_weight * c
                 logs[f"cos/{name}"] = float(c.detach())
-            if cfg.sim_weight:
-                s = similarity_loss(pooled, target)
-                parts = parts + cfg.sim_weight * s
-                logs[f"sim/{name}"] = float(s.detach())
-            if cfg.resim_weight:
-                r = relative_similarity_loss(
-                    pooled,
-                    target,
-                    cfg.resim_margin,
-                    cfg.resim_num_samples,
-                    self._generator(pooled.device),
-                )
-                parts = parts + cfg.resim_weight * r
-                logs[f"resim/{name}"] = float(r.detach())
+            if shared:
+                z = zscore(offdiag_similarities(target))
+                shared_gram = (weight / weight_sum) * z if shared_gram is None else shared_gram + (weight / weight_sum) * z
+            else:
+                if cfg.sim_weight:
+                    s = similarity_loss(pooled, target, standardize=cfg.gram_standardize)
+                    parts = parts + cfg.sim_weight * s
+                    logs[f"sim/{name}"] = float(s.detach())
+                if cfg.resim_weight:
+                    r = relative_similarity_loss(
+                        pooled,
+                        target,
+                        cfg.resim_margin,
+                        cfg.resim_num_samples,
+                        self._generator(pooled.device),
+                    )
+                    parts = parts + cfg.resim_weight * r
+                    logs[f"resim/{name}"] = float(r.detach())
             total = total + (weight / weight_sum) * parts
+        if shared and shared_gram is not None:
+            student_pairs = offdiag_similarities(pooled)
+            target_pairs = zscore(shared_gram)  # averaging disagreeing teachers shrinks the spread: restore it
+            if cfg.sim_weight:
+                s = F.mse_loss(zscore(student_pairs), target_pairs)
+                total = total + cfg.sim_weight * s
+                logs["sim/shared"] = float(s.detach())
+            if cfg.resim_weight:
+                r = ranking_hinge(
+                    student_pairs, target_pairs, cfg.resim_margin, cfg.resim_num_samples, self._generator(pooled.device)
+                )
+                total = total + cfg.resim_weight * r
+                logs["resim/shared"] = float(r.detach())
         if cfg.gor_weight:
             g = gor_loss(pooled)
             total = total + cfg.gor_weight * g

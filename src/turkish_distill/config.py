@@ -40,6 +40,10 @@ class TeacherConfig:
     weight_start: Optional[float] = None
     ramp_start_step: int = 0
     ramp_end_step: int = 0
+    # Method (a), vector centring: subtract the mean of this teacher's cached vectors over the corpus and
+    # re-normalise before they are used as targets (all loss terms). It opens up a teacher whose vectors sit in a
+    # narrow cone (mE5: mean pairwise cosine 0.82). The cache itself is not changed.
+    center: bool = False
 
 
 def teacher_weight(teacher: TeacherConfig, step: int) -> float:
@@ -79,6 +83,29 @@ class LossConfig:
     resim_margin: float = 0.015
     resim_num_samples: int = 4096
     gor_weight: float = 0.0
+    # Method (b), Gram standardisation: the similarity-matrix term compares z-scored off-diagonal entries of the
+    # student's and the teacher's in-batch cosine matrices (mean 0, std 1 each), so a teacher's offset and scale
+    # no longer matter (MSE of z-scores = 2 * (1 - Pearson correlation)). The units change (raw MSE ~0.001,
+    # z-score MSE ~0.3), so use about sim_weight 1 instead of 200. The ranking hinge only uses the teacher's order
+    # and is not affected.
+    gram_standardize: bool = False
+    # Method (c), "per_teacher" (default): every teacher gets its own relation terms. "shared": the teachers'
+    # z-scored Gram matrices are averaged with the teacher weights into ONE target matrix (re-standardised) that
+    # feeds the similarity and ranking terms once; the vector term stays per teacher. Shared always standardises.
+    relation_mode: str = "per_teacher"
+
+
+@dataclass
+class FusionConfig:
+    # Method (d), shared vector space: "aligned_mean" reduces every teacher to `dim` PCA components, rotates each
+    # onto the `reference` teacher's space with an orthogonal Procrustes fit on `fit_samples` texts, and averages
+    # the aligned unit vectors with the teacher weights into one fused target. The student then has a single head
+    # (dim `dim`) and a single "teacher" called "fused". "none" keeps the usual one head per teacher.
+    mode: str = "none"
+    reference: str = ""
+    dim: int = 512
+    fit_samples: int = 20_000
+    seed: int = 0
 
 
 @dataclass
@@ -124,6 +151,7 @@ class ExperimentConfig:
     loss: LossConfig = field(default_factory=LossConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
+    fusion: FusionConfig = field(default_factory=FusionConfig)
     tensorboard: bool = True
     # Optional local scratch directory; checkpoints are written here first
     # and then moved to output_dir (e.g. Colab /content -> Drive).
@@ -164,6 +192,7 @@ _SECTIONS = {
     "loss": LossConfig,
     "train": TrainConfig,
     "eval": EvalConfig,
+    "fusion": FusionConfig,
 }
 
 
@@ -229,6 +258,24 @@ def validate(cfg: ExperimentConfig) -> None:
         raise ValueError("train.batch_size must be >= 2 (similarity losses need pairs)")
     if cfg.train.chunk_size is not None and cfg.train.chunk_size < 1:
         raise ValueError("train.chunk_size must be >= 1 or null")
+    if cfg.loss.relation_mode not in ("per_teacher", "shared"):
+        raise ValueError(f"loss.relation_mode must be 'per_teacher' or 'shared', got {cfg.loss.relation_mode!r}")
+    fusion = cfg.fusion
+    if fusion.mode not in ("none", "aligned_mean"):
+        raise ValueError(f"fusion.mode must be 'none' or 'aligned_mean', got {fusion.mode!r}")
+    if fusion.mode != "none":
+        if len(cfg.teachers) < 2:
+            raise ValueError("fusion needs at least two teachers")
+        if fusion.reference not in names:
+            raise ValueError(f"fusion.reference must be one of the teachers {names}, got {fusion.reference!r}")
+        if fusion.dim < 2 or fusion.dim > min(t.dim for t in cfg.teachers):
+            raise ValueError("fusion.dim must be between 2 and the smallest teacher dimension")
+        if fusion.fit_samples < fusion.dim:
+            raise ValueError("fusion.fit_samples must be at least fusion.dim")
+        if any(t.weight_start is not None for t in cfg.teachers):
+            raise ValueError("fusion uses static teacher weights: remove weight_start/ramp settings")
+        if any(t.center for t in cfg.teachers):
+            raise ValueError("fusion centres the teachers itself (PCA): remove teachers[].center")
 
 
 def dump_config(cfg: ExperimentConfig, path: str | Path) -> None:

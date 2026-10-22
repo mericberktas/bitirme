@@ -157,3 +157,40 @@ def test_training_runs_with_only_the_vector_term_or_only_the_relation_terms(expe
     assert results["vector"][0] is True and results["relation"][0] is False  # no vector term, no gradient to the heads
     assert "cos" in results["vector"][1] and "sim" not in results["vector"][1] and "resim" not in results["vector"][1]
     assert "cos" not in results["relation"][1] and {"sim", "resim"} <= results["relation"][1]
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["center", "gram_standardize", "shared_relation", "fusion"],
+)
+def test_training_runs_with_each_target_method(experiment, tmp_path, method):
+    """Methods a-d run through the real loop (heads, loss, diagnostics, checkpoints) and stay finite."""
+    import dataclasses
+
+    from turkish_distill.config import FusionConfig
+    from turkish_distill.train import apply_target_methods
+
+    texts = make_texts(120)
+    model, caches = build(experiment, texts)  # the fake teachers t_big and t_small
+    cfg = experiment
+    if method == "center":
+        cfg.teachers[0].center = True
+    elif method == "gram_standardize":
+        cfg.loss.gram_standardize = True
+        cfg.loss.sim_weight = 1.0
+    elif method == "shared_relation":
+        cfg.loss.relation_mode = "shared"
+        cfg.loss.sim_weight = 1.0
+    else:
+        cfg.fusion = FusionConfig(mode="aligned_mean", reference=cfg.teachers[0].name, dim=8, fit_samples=60)
+    cfg, caches = apply_target_methods(cfg, caches)
+    if method == "fusion":
+        model = StudentEncoder(TinyBackbone(), 16, {t.name: t.dim for t in cfg.teachers})
+        assert [t.name for t in cfg.teachers] == ["fused"]
+    run_dir = tmp_path / "run"
+    result = run_training(cfg, run_dir, model, CharTokenizer(), texts, caches, torch.device("cpu"))
+    assert result["final_step"] == 6 and result["last_loss"] is not None and torch.isfinite(torch.tensor(result["last_loss"]))
+    records = read_metrics(run_dir / "metrics.jsonl")
+    assert all(torch.isfinite(torch.tensor(r["train/total"])) for r in records if "train/total" in r)
+    if method == "shared_relation":
+        assert any("train/sim/shared" in r for r in records)

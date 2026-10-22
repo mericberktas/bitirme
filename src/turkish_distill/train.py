@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import time
 import warnings
 from pathlib import Path
@@ -16,7 +17,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .checkpoint import cleanup_stale, latest_checkpoint, load_checkpoint, save_checkpoint
-from .config import ExperimentConfig, dump_config, load_config
+from .config import ExperimentConfig, TeacherConfig, dump_config, load_config, teacher_weight
 from .contrastive import _capture_rng, _restore_rng, evaluate_retrieval, load_pairs
 from .data import Collator, ListDataset, epoch_batches, load_corpus
 from .diagnostics import effective_rank, geometry_agreement, mean_pairwise_cosine, teacher_cosine
@@ -24,6 +25,7 @@ from .eval.sts import evaluate_sts, load_sts_pairs, make_student_encode_fn
 from .logging_utils import MetricsLogger
 from .losses import MultiTeacherLoss
 from .models import StudentEncoder
+from .targets import ArrayCache, CenteredCache, fuse_teachers
 from .teachers import TeacherCache, corpus_fingerprint
 from .utils import describe_device, get_device, git_sha, set_seed, write_env_info
 
@@ -275,6 +277,28 @@ def run_training(
     return {"final_step": step, "last_loss": last_logs.get("total")}
 
 
+def apply_target_methods(cfg: ExperimentConfig, caches: dict[str, Any]) -> tuple[ExperimentConfig, dict[str, Any]]:
+    """Methods (a) and (d): centre teachers (`teachers[].center`) or fuse them into one target (`fusion`).
+
+    Returns the config the training loop should use (with fusion the only teacher is the fused one) and the
+    matching caches. Without either option both are returned unchanged.
+    """
+    if cfg.fusion.mode != "none":
+        weights = {t.name: teacher_weight(t, 0) for t in cfg.teachers}
+        fused, report = fuse_teachers(
+            caches, weights, cfg.fusion.reference, cfg.fusion.dim, cfg.fusion.fit_samples, cfg.fusion.seed
+        )
+        print(f"fusion: {report}", flush=True)
+        fused_teacher = TeacherConfig(name="fused", hf_id="fusion:aligned_mean", dim=cfg.fusion.dim, weight=1.0)
+        return dataclasses.replace(cfg, teachers=[fused_teacher]), {"fused": ArrayCache(fused)}
+    wrapped = dict(caches)
+    for t in cfg.teachers:
+        if t.center:
+            wrapped[t.name] = CenteredCache(caches[t.name])
+            print(f"centred teacher {t.name}: mean vector norm {float(np.linalg.norm(wrapped[t.name].mean)):.3f}", flush=True)
+    return cfg, wrapped
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Multi-teacher distillation training")
     parser.add_argument("--config", required=True)
@@ -298,6 +322,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     texts = load_corpus(cfg.data, cfg.train.seed)
     fingerprint = corpus_fingerprint(texts)
     caches = {t.name: TeacherCache.open(cfg.data.cache_dir, t, fingerprint, len(texts)) for t in cfg.teachers}
+    cfg, caches = apply_target_methods(cfg, caches)
     tokenizer = AutoTokenizer.from_pretrained(cfg.student.hf_id, revision=cfg.student.revision)
     model = StudentEncoder.from_pretrained(cfg.student, cfg.teachers)
 
