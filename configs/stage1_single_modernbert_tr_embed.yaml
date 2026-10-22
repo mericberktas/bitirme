@@ -1,0 +1,73 @@
+# Stage 1, teacher = the lab's own 8K embedding model (ytu-ce-cosmos/modernbert-tr-embed, 150M, 768-d). Same size and
+# same output dimension as the student, so this is the "no capacity gap" teacher: if the student matches it much
+# better than it matches BGE-M3 (cosine 0.77) or Qwen3-8B (0.67), imitability matters. The teacher was itself
+# distilled from Qwen3-Embedding-8B (~7.9M passages), then fine-tuned three times (retrieval, multi-task,
+# cross-lingual) and weight-averaged (model card). Our own TR-MTEB measurement: 67.03. Everything but the teacher
+# is identical to stage1_single_bge_m3.yaml (reference: 62.59 +- 0.18 over three seeds).
+#
+# Teacher encoding (checked against the model card): sentence-transformers pipeline = transformer + mean pooling +
+# Normalize (modules.json). The card gives a query prompt ("Instruct: Given a web search query, retrieve relevant
+# passages that answer the query\nQuery:") and NO document prompt; like every other teacher here the corpus is
+# encoded plain (doc_prefix ""), which matches our plain TR-MTEB protocol. About 62% of the stage-1 texts are
+# questions, so the teacher sees them without its query prompt (the same situation as mE5-instruct).
+# The card's usage example loads "mrbesher/modernbert-tr-embed"; this config pins the ytu-ce-cosmos repository.
+
+name: stage1_single_modernbert_tr_embed
+output_dir: /content/drive/MyDrive/bitirme/runs
+local_tmp_dir: /content/ckpt_staging
+tensorboard: true
+
+teachers:
+  - name: modernbert_tr_embed
+    hf_id: ytu-ce-cosmos/modernbert-tr-embed
+    revision: 855820e0079102805908d60d32cd9fd59c970b80
+    dim: 768
+    doc_prefix: ""
+    max_length: 512
+    batch_size: 64
+    dtype: float32           # 150M model: full precision costs little and avoids any fp16 overflow question
+    weight: 1.0
+
+student:
+  hf_id: ytu-ce-cosmos/modernbert-tr-base-1k
+  revision: c2e35f553101cce5b03fbb318ef8728473fd34dd
+  max_length: 512
+  pooling: mean
+
+data:
+  corpus_path: /content/drive/MyDrive/bitirme/data/stage1/corpus_train.jsonl
+  text_column: text
+  cache_dir: /content/drive/MyDrive/bitirme/cache/teachers
+  shard_size: 10000
+  max_samples: null
+  min_chars: 10
+  val_size: 2000
+
+loss:
+  cosine_weight: 10.0
+  sim_weight: 200.0
+  resim_weight: 20.0
+  resim_margin: 0.015
+  resim_num_samples: 4096
+  gor_weight: 0.0
+
+train:
+  batch_size: 128
+  chunk_size: 32             # gradient caching: same maths, memory of 32 texts (null ran out of memory on an L4)
+  lr: 5.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_steps: 1800
+  grad_clip: 1.0
+  bf16: true
+  seed: 42
+  num_workers: 2
+  log_every: 25
+  diag_every: 300
+  ckpt_every: 300
+  keep_last: 2
+
+eval:
+  sts_dataset: null
+  pairs_val: /content/drive/MyDrive/bitirme/data/stage1/pairs_val.jsonl
+  query_max_length: 64
