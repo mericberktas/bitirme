@@ -169,3 +169,25 @@ def method_overrides(method: Optional[str], teacher_names: list[str]) -> tuple[l
                 "fusion.fit_samples=20000",
             ]
     return overrides, "_".join(m for m in METHODS if m in chosen)
+
+
+def geometry_report(cache, sample: int = 3000, seed: int = 0, centered: bool = False) -> dict[str, float]:
+    """Spread of a teacher's space: mean, std and 5th/95th percentile of the pairwise cosines of a text sample.
+
+    `centered=True` reports the same after subtracting the corpus mean (what `CenteredCache` would serve), so the
+    effect of method (a) can be read off before any training. The cache is only read.
+    """
+    n = len(cache)
+    rng = np.random.default_rng(seed)
+    idx = np.sort(rng.choice(n, size=min(sample, n), replace=False))
+    x = cache.get(idx)
+    if centered:
+        x = _unit(x - compute_mean(cache))
+    sims = x @ x.T
+    off = sims[~np.eye(len(x), dtype=bool)]
+    return {
+        "mean_cosine": float(off.mean()),
+        "std": float(off.std()),
+        "p5": float(np.percentile(off, 5)),
+        "p95": float(np.percentile(off, 95)),
+    }

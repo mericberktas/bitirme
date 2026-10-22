@@ -196,3 +196,12 @@ def test_method_overrides_reject_incompatible_choices(bad, teachers):
 
     with pytest.raises(ValueError):
         method_overrides(bad, teachers)
+
+
+def test_geometry_report_shows_the_cone_and_centring_opens_it():
+    from turkish_distill.targets import geometry_report
+
+    cache = FakeCache(cone_vectors(n=500, d=16, offset=6.0, seed=3))
+    raw, new = geometry_report(cache, sample=300), geometry_report(cache, sample=300, centered=True)
+    assert raw["mean_cosine"] > 0.8 and raw["std"] < 0.1 and raw["p5"] < raw["mean_cosine"] < raw["p95"]
+    assert abs(new["mean_cosine"]) < 0.1 and new["std"] > 2 * raw["std"]

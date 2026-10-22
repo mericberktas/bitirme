@@ -25,7 +25,7 @@ from .eval.sts import evaluate_sts, load_sts_pairs, make_student_encode_fn
 from .logging_utils import MetricsLogger
 from .losses import MultiTeacherLoss
 from .models import StudentEncoder
-from .targets import ArrayCache, CenteredCache, fuse_teachers
+from .targets import ArrayCache, CenteredCache, fuse_teachers, geometry_report
 from .teachers import TeacherCache, corpus_fingerprint
 from .utils import describe_device, get_device, git_sha, set_seed, write_env_info
 
@@ -295,7 +295,12 @@ def apply_target_methods(cfg: ExperimentConfig, caches: dict[str, Any]) -> tuple
     for t in cfg.teachers:
         if t.center:
             wrapped[t.name] = CenteredCache(caches[t.name])
-            print(f"centred teacher {t.name}: mean vector norm {float(np.linalg.norm(wrapped[t.name].mean)):.3f}", flush=True)
+            raw, new = geometry_report(caches[t.name]), geometry_report(caches[t.name], centered=True)
+            print(
+                f"centred teacher {t.name}: mean vector norm {float(np.linalg.norm(wrapped[t.name].mean)):.3f}; "
+                f"pairwise cosine mean/std {raw['mean_cosine']:.3f}/{raw['std']:.3f} -> {new['mean_cosine']:.3f}/{new['std']:.3f}",
+                flush=True,
+            )
     return cfg, wrapped
 
 
