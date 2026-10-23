@@ -160,9 +160,9 @@ def method_overrides(method: Optional[str], teacher_names: list[str]) -> tuple[l
         if m == "center":
             overrides += [f"teachers.{i}.center=true" for i in range(len(teacher_names))]
         elif m == "gram":
-            overrides += ["loss.gram_standardize=true", "loss.sim_weight=1.0"]
+            overrides += ["loss.gram_standardize=true"]
         elif m == "shared":
-            overrides += ["loss.relation_mode=shared", "loss.sim_weight=1.0"]
+            overrides += ["loss.relation_mode=shared"]
         else:
             overrides += [
                 "fusion.mode=aligned_mean", f"fusion.reference={teacher_names[0]}", "fusion.dim=512",

@@ -59,15 +59,23 @@ def test_apply_target_methods_only_touches_flagged_teachers():
 
 # ---- (b) Gram standardisation ---------------------------------------------------------------------------------
 
-def test_standardised_similarity_ignores_offset_and_scale_of_the_teacher_gram():
+def test_gram_standardisation_gives_the_teacher_the_reference_geometry_and_keeps_the_student_raw():
+    from turkish_distill.losses import offdiag_similarities, standardized_teacher_pairs
+
     torch.manual_seed(0)
     x = torch.randn(12, 8)
     teacher = torch.randn(12, 5)
-    # Adding one shared direction pushes every teacher vector into a cone: its cosine matrix gets a large offset
-    # and a different spread, so the plain loss is large; the z-scored loss only compares the pattern.
-    cone_teacher = teacher + 6.0 * torch.randn(1, 5)
+    cone_teacher = teacher + 6.0 * torch.randn(1, 5)  # one shared direction: a cone, large offset, small spread
+    for t in (teacher, cone_teacher):
+        pairs = standardized_teacher_pairs(t, 0.30, 0.07)
+        # whatever the teacher's own offset and spread, the target has the reference mean and std
+        assert pairs.mean().item() == pytest.approx(0.30, abs=1e-5)
+        assert pairs.std(unbiased=False).item() == pytest.approx(0.07, abs=1e-4)
+        # and the teacher's own order of pairs is kept
+        assert torch.equal(torch.argsort(pairs), torch.argsort(offdiag_similarities(t)))
+    # The plain loss reacts to a cone teacher; the standardised one gives both teachers a target of the same
+    # geometry, so the two losses of the same student differ only through the pattern.
     assert similarity_loss(x, cone_teacher).item() > 0.05
-    assert similarity_loss(x, x, standardize=True).item() == pytest.approx(0.0, abs=1e-5)
     # z-scoring really gives mean 0 and std 1, and is unchanged by an affine transformation
     v = torch.randn(100)
     z = zscore(v * 3 + 7)
@@ -75,14 +83,18 @@ def test_standardised_similarity_ignores_offset_and_scale_of_the_teacher_gram():
     assert torch.allclose(z, zscore(v), atol=1e-4)
 
 
-def test_standardised_loss_equals_two_times_one_minus_pearson():
+def test_standardised_similarity_loss_still_pins_down_the_student_offset_and_scale():
+    """The point of the fix: the student's own cosines are NOT standardised, so a student that stays in a narrow
+    cone is penalised (a Pearson-style loss, which z-scores both sides, would not)."""
     torch.manual_seed(1)
-    s, t = torch.randn(10, 6), torch.randn(10, 9)
-    from turkish_distill.losses import offdiag_similarities
-
-    a, b = offdiag_similarities(s), offdiag_similarities(t)
-    pearson = np.corrcoef(a.numpy(), b.numpy())[0, 1]
-    assert similarity_loss(s, t, standardize=True).item() == pytest.approx(2 * (1 - pearson), abs=1e-4)
+    teacher = torch.randn(16, 8)
+    ref_mean, ref_std = 0.30, 0.07
+    spread_student = torch.randn(16, 8)  # unrelated pattern, wide spread: a large loss
+    cone_student = torch.randn(16, 8) + 8.0 * torch.randn(1, 8)  # narrow cone
+    loss_cone = similarity_loss(cone_student, teacher, True, ref_mean, ref_std).item()
+    loss_spread = similarity_loss(spread_student, teacher, True, ref_mean, ref_std).item()
+    assert loss_cone > 0.3  # a cone student has cosines near 0.9, far from the reference mean of 0.3
+    assert loss_cone > loss_spread
 
 
 # ---- (c) shared relation target --------------------------------------------------------------------------------
@@ -92,7 +104,7 @@ def _two_teacher_loss(mode, standardize=False, weights=(1.0, 1.0)):
         TeacherConfig(name="a", hf_id="a", dim=8, weight=weights[0]),
         TeacherConfig(name="b", hf_id="b", dim=12, weight=weights[1]),
     ]
-    cfg = LossConfig(relation_mode=mode, gram_standardize=standardize, sim_weight=1.0 if standardize or mode == "shared" else 200.0)
+    cfg = LossConfig(relation_mode=mode, gram_standardize=standardize)
     return MultiTeacherLoss(cfg, teachers, seed=0)
 
 
@@ -174,12 +186,12 @@ def test_method_overrides_map_to_config_values_and_a_stable_name_suffix(tmp_path
     assert method_overrides(None, ["a"]) == ([], "") and method_overrides("", ["a"]) == ([], "")
     ov, suffix = method_overrides("gram+center", ["a", "b"])
     assert suffix == "center_gram"  # fixed order whatever the writing order
-    assert ov == ["teachers.0.center=true", "teachers.1.center=true", "loss.gram_standardize=true", "loss.sim_weight=1.0"]
+    assert ov == ["teachers.0.center=true", "teachers.1.center=true", "loss.gram_standardize=true"]
     path = tmp_path / "c.yaml"
     path.write_text(yaml.safe_dump({"name": "x", "output_dir": "o", "teachers": [
         {"name": "a", "hf_id": "a", "dim": 24}, {"name": "b", "hf_id": "b", "dim": 32}]}), encoding="utf-8")
     cfg = load_config(path, ov)
-    assert all(t.center for t in cfg.teachers) and cfg.loss.gram_standardize and cfg.loss.sim_weight == 1.0
+    assert all(t.center for t in cfg.teachers) and cfg.loss.gram_standardize and cfg.loss.sim_weight == 200.0
     ov, suffix = method_overrides("shared", ["a", "b"])
     assert suffix == "shared" and load_config(path, ov).loss.relation_mode == "shared"
     path.write_text(yaml.safe_dump({"name": "x", "output_dir": "o", "teachers": [

@@ -83,15 +83,21 @@ class LossConfig:
     resim_margin: float = 0.015
     resim_num_samples: int = 4096
     gor_weight: float = 0.0
-    # Method (b), Gram standardisation: the similarity-matrix term compares z-scored off-diagonal entries of the
-    # student's and the teacher's in-batch cosine matrices (mean 0, std 1 each), so a teacher's offset and scale
-    # no longer matter (MSE of z-scores = 2 * (1 - Pearson correlation)). The units change (raw MSE ~0.001,
-    # z-score MSE ~0.3), so use about sim_weight 1 instead of 200. The ranking hinge only uses the teacher's order
-    # and is not affected.
+    # Method (b), Gram standardisation: the TEACHER's in-batch cosine matrix is standardised (z-scored over its
+    # off-diagonal entries) and re-scaled to a fixed reference mean/std (`gram_target_mean`, `gram_target_std`,
+    # BGE-M3's 0.29 / 0.07 by default); the student's matrix stays in raw cosine units. The pattern of who is more
+    # similar than whom is the teacher's, its offset and spread are the reference's (a teacher in a narrow cone,
+    # mE5: mean 0.82, std 0.04, then asks for the same absolute geometry as BGE-M3). The units are the raw ones, so
+    # keep sim_weight 200. The ranking hinge only uses the teacher's order and is not affected. (A first version
+    # z-scored the student too: the student's own offset and scale were then free, it stayed in a narrow cone
+    # and mE5 fell from 58.46 to 52.85.)
     gram_standardize: bool = False
+    gram_target_mean: float = 0.30
+    gram_target_std: float = 0.07
     # Method (c), "per_teacher" (default): every teacher gets its own relation terms. "shared": the teachers'
     # z-scored Gram matrices are averaged with the teacher weights into ONE target matrix (re-standardised) that
-    # feeds the similarity and ranking terms once; the vector term stays per teacher. Shared always standardises.
+    # feeds the similarity and ranking terms once (re-scaled to the reference mean/std above, the student stays in
+    # raw cosine units); the vector term stays per teacher. Shared always standardises.
     relation_mode: str = "per_teacher"
 
 
@@ -258,6 +264,8 @@ def validate(cfg: ExperimentConfig) -> None:
         raise ValueError("train.batch_size must be >= 2 (similarity losses need pairs)")
     if cfg.train.chunk_size is not None and cfg.train.chunk_size < 1:
         raise ValueError("train.chunk_size must be >= 1 or null")
+    if cfg.loss.gram_target_std <= 0:
+        raise ValueError("loss.gram_target_std must be positive")
     if cfg.loss.relation_mode not in ("per_teacher", "shared"):
         raise ValueError(f"loss.relation_mode must be 'per_teacher' or 'shared', got {cfg.loss.relation_mode!r}")
     fusion = cfg.fusion

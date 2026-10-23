@@ -40,14 +40,33 @@ def zscore(values: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return centred / (centred.pow(2).mean().sqrt() + eps)
 
 
-def similarity_loss(student: torch.Tensor, teacher: torch.Tensor, standardize: bool = False) -> torch.Tensor:
+def standardized_teacher_pairs(
+    teacher: torch.Tensor, ref_mean: float, ref_std: float
+) -> torch.Tensor:
+    """The teacher's pairwise cosines, standardised and re-scaled to a fixed reference mean and std.
+
+    The pattern of which pairs are more similar than others is the teacher's; the offset and spread are the
+    reference's, so a teacher whose vectors sit in a narrow cone (mE5) asks the student for the same absolute
+    geometry as a spread-out one (BGE-M3: mean 0.29, std 0.07).
+    """
+    return ref_mean + ref_std * zscore(offdiag_similarities(teacher))
+
+
+def similarity_loss(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    standardize: bool = False,
+    ref_mean: float = 0.30,
+    ref_std: float = 0.07,
+) -> torch.Tensor:
     """MSE between the in-batch cosine-similarity matrices of student and teacher.
 
-    With `standardize` the off-diagonal entries of both matrices are z-scored first (method b), so only the
-    pattern of which pairs are more similar than others is matched, not the offset or the scale.
+    With `standardize` (method b) only the TEACHER side is standardised and re-scaled to (`ref_mean`, `ref_std`);
+    the student's own cosines stay as they are. Standardising the student too (Pearson matching) leaves its offset
+    and scale free, and a student that is free to stay in a narrow cone did (mE5: 52.85 against 58.46).
     """
     if standardize:
-        return F.mse_loss(zscore(offdiag_similarities(student)), zscore(offdiag_similarities(teacher)))
+        return F.mse_loss(offdiag_similarities(student), standardized_teacher_pairs(teacher, ref_mean, ref_std))
     s = F.normalize(student.float(), dim=-1)
     t = F.normalize(teacher.float(), dim=-1)
     return F.mse_loss(s @ s.T, t @ t.T)
@@ -160,7 +179,9 @@ class MultiTeacherLoss(nn.Module):
                 shared_gram = (weight / weight_sum) * z if shared_gram is None else shared_gram + (weight / weight_sum) * z
             else:
                 if cfg.sim_weight:
-                    s = similarity_loss(pooled, target, standardize=cfg.gram_standardize)
+                    s = similarity_loss(
+                        pooled, target, cfg.gram_standardize, cfg.gram_target_mean, cfg.gram_target_std
+                    )
                     parts = parts + cfg.sim_weight * s
                     logs[f"sim/{name}"] = float(s.detach())
                 if cfg.resim_weight:
@@ -176,9 +197,10 @@ class MultiTeacherLoss(nn.Module):
             total = total + (weight / weight_sum) * parts
         if shared and shared_gram is not None:
             student_pairs = offdiag_similarities(pooled)
-            target_pairs = zscore(shared_gram)  # averaging disagreeing teachers shrinks the spread: restore it
+            # averaging disagreeing teachers shrinks the spread: re-standardise, then give it the reference geometry
+            target_pairs = cfg.gram_target_mean + cfg.gram_target_std * zscore(shared_gram)
             if cfg.sim_weight:
-                s = F.mse_loss(zscore(student_pairs), target_pairs)
+                s = F.mse_loss(student_pairs, target_pairs)
                 total = total + cfg.sim_weight * s
                 logs["sim/shared"] = float(s.detach())
             if cfg.resim_weight:
