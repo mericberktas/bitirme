@@ -1,0 +1,77 @@
+# Stage 1, Qwen3-Embedding-8B as a single teacher, but the QUESTION texts (55% of the stage-1 texts: those in
+# pairs_train/pairs_val) are encoded with the model's query instruction, the passages stay plain, as the model card
+# prescribes ("No need to add instruction for retrieval documents"). The student still sees the raw text. The plain
+# run (stage1_single_qwen3_8b, 61.05) encoded everything without the instruction. Only the questions go through the
+# model: the passage vectors are copied from the existing qwen3_8b cache (same model and revision).
+#
+# Instruction format (model card, Transformers helper get_detailed_instruct): "Instruct: {task}", a line break,
+# then "Query:{query}" with NO space after "Query:" (the card's TEI example has one, so the card is inconsistent);
+# the task is the card's
+# example, "Given a web search query, retrieve relevant passages that answer the query". The Qwen3 task text was
+# written in English on purpose: it is the one the model card gives.
+# Everything but the teacher entry is identical to stage1_single_qwen3_8b.yaml.
+
+name: stage1_single_qwen3_8b_instr
+output_dir: /content/drive/MyDrive/bitirme/runs
+local_tmp_dir: /content/ckpt_staging
+tensorboard: true
+
+teachers:
+  - name: qwen3_8b_instr
+    hf_id: Qwen/Qwen3-Embedding-8B
+    revision: 1d8ad4ca9b3dd8059ad90a75d4983776a23d44af
+    dim: 4096
+    doc_prefix: ""
+    max_length: 512
+    batch_size: 32
+    dtype: bfloat16
+    weight: 1.0
+    query_prefix: "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
+    query_sources:
+      - /content/drive/MyDrive/bitirme/data/stage1/pairs_train.jsonl
+      - /content/drive/MyDrive/bitirme/data/stage1/pairs_val.jsonl
+    reuse_plain_from: qwen3_8b
+
+student:
+  hf_id: ytu-ce-cosmos/modernbert-tr-base-1k
+  revision: c2e35f553101cce5b03fbb318ef8728473fd34dd
+  max_length: 512
+  pooling: mean
+
+data:
+  corpus_path: /content/drive/MyDrive/bitirme/data/stage1/corpus_train.jsonl
+  text_column: text
+  cache_dir: /content/drive/MyDrive/bitirme/cache/teachers   # cache folders are keyed by the corpus fingerprint
+  shard_size: 10000
+  max_samples: null          # use all stage-1 texts
+  min_chars: 10              # prepare_pairs keeps questions of 10+ characters; the default 20 would drop some
+  val_size: 2000
+
+loss:
+  cosine_weight: 10.0
+  sim_weight: 200.0
+  resim_weight: 20.0
+  resim_margin: 0.015
+  resim_num_samples: 4096
+  gor_weight: 0.0
+
+train:
+  batch_size: 128
+  chunk_size: 32             # gradient caching: same maths, memory of 32 texts (null ran out of memory on an L4)
+  lr: 5.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_steps: 1800
+  grad_clip: 1.0
+  bf16: true
+  seed: 42
+  num_workers: 2
+  log_every: 25
+  diag_every: 300
+  ckpt_every: 300
+  keep_last: 2
+
+eval:
+  sts_dataset: null
+  pairs_val: /content/drive/MyDrive/bitirme/data/stage1/pairs_val.jsonl   # val/mrr@10, same as the contrastive runs
+  query_max_length: 64

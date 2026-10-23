@@ -12,6 +12,7 @@ fingerprint ties a cache to the exact text list it was computed from.
 
 from __future__ import annotations
 
+import dataclasses
 import gc
 import hashlib
 import json
@@ -143,6 +144,40 @@ def make_sentence_transformer_encoder(teacher: TeacherConfig) -> tuple[EncodeFn,
     return encode, close
 
 
+def load_query_set(paths: list[str]) -> set[str]:
+    """The question texts listed in the `question` field of JSONL files (the prepare_pairs outputs)."""
+    questions: set[str] = set()
+    for path in paths:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    questions.add(json.loads(line)["question"])
+    return questions
+
+
+def _encode_chunk(
+    teacher: TeacherConfig,
+    chunk: list[str],
+    is_query: Optional[list[bool]],
+    encode_fn: EncodeFn,
+    base_vectors: Optional[np.ndarray],
+) -> np.ndarray:
+    """Vectors of one shard of texts: questions with the query prefix, the rest plain (or copied from `base_vectors`)."""
+    if is_query is None:
+        return _normalize(np.asarray(encode_fn([teacher.doc_prefix + t for t in chunk])))
+    out = np.empty((len(chunk), teacher.dim), dtype=np.float32)
+    q_pos = [i for i, flag in enumerate(is_query) if flag]
+    o_pos = [i for i, flag in enumerate(is_query) if not flag]
+    if q_pos:
+        out[q_pos] = _normalize(np.asarray(encode_fn([teacher.query_prefix + chunk[i] for i in q_pos])))
+    if o_pos:
+        if base_vectors is not None:
+            out[o_pos] = base_vectors[o_pos]
+        else:
+            out[o_pos] = _normalize(np.asarray(encode_fn([teacher.doc_prefix + chunk[i] for i in o_pos])))
+    return out
+
+
 def encode_teacher(
     teacher: TeacherConfig,
     texts: list[str],
@@ -171,6 +206,24 @@ def encode_teacher(
                 f"now shard_size={shard_size}. Use the old value or delete that directory."
             )
 
+    query_mask: Optional[list[bool]] = None
+    base_cache = None
+    if teacher.query_prefix:
+        queries = load_query_set(teacher.query_sources)
+        query_mask = [t in queries for t in texts]
+        if teacher.reuse_plain_from:
+            base_cfg = dataclasses.replace(
+                teacher, name=teacher.reuse_plain_from, query_prefix="", query_sources=[], reuse_plain_from=None
+            )
+            base_cache = TeacherCache.open(cache_root, base_cfg, fingerprint, len(texts))
+            if base_cache.meta.get("doc_prefix", "") != teacher.doc_prefix:
+                raise ValueError(
+                    f"teacher {teacher.name}: the plain cache {teacher.reuse_plain_from} used doc_prefix "
+                    f"{base_cache.meta.get('doc_prefix')!r}, this teacher uses {teacher.doc_prefix!r}"
+                )
+        if verbose:
+            print(f"[{teacher.name}] {sum(query_mask)} of {len(texts)} texts are questions and get the query prefix", flush=True)
+
     lock = _acquire_lock(directory, teacher, lock_timeout_s, ignore_lock)
     close = lambda: None  # noqa: E731
     try:
@@ -193,8 +246,10 @@ def encode_teacher(
                         f"Use the original value or delete {directory}."
                     )
                 continue
-            batch = [teacher.doc_prefix + t for t in texts[lo:hi]]
-            vectors = _normalize(np.asarray(encode_fn(batch)))
+            base_vectors = base_cache.get(np.arange(lo, hi)) if base_cache is not None else None
+            vectors = _encode_chunk(
+                teacher, texts[lo:hi], query_mask[lo:hi] if query_mask is not None else None, encode_fn, base_vectors
+            )
             if vectors.shape != (hi - lo, teacher.dim):
                 raise ValueError(
                     f"teacher {teacher.name}: expected shape {(hi - lo, teacher.dim)}, got {vectors.shape}. "
@@ -217,6 +272,9 @@ def encode_teacher(
         "revision": teacher.revision,
         "dim": teacher.dim,
         "doc_prefix": teacher.doc_prefix,
+        "query_prefix": teacher.query_prefix,
+        "n_query_texts": sum(query_mask) if query_mask is not None else 0,
+        "reuse_plain_from": teacher.reuse_plain_from,
         "max_length": teacher.max_length,
         "dtype": teacher.dtype,
         "n_texts": len(texts),

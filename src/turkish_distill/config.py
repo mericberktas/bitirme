@@ -44,6 +44,15 @@ class TeacherConfig:
     # re-normalise before they are used as targets (all loss terms). It opens up a teacher whose vectors sit in a
     # narrow cone (mE5: mean pairwise cosine 0.82). The cache itself is not changed.
     center: bool = False
+    # Query instruction for instruction-aware teachers (Qwen3-Embedding, E5-instruct models), applied ONLY to the
+    # texts that are questions: those listed in the `question` field of the JSONL files in `query_sources`
+    # (the prepare_pairs outputs). Other texts keep `doc_prefix`. The student still sees the raw text. With
+    # `reuse_plain_from` (the name of another teacher entry: the same model and revision, already encoded without
+    # the instruction) the vectors of the non-question texts are copied from that cache instead of being encoded
+    # again, so only the questions go through the model.
+    query_prefix: str = ""
+    query_sources: list[str] = field(default_factory=list)
+    reuse_plain_from: Optional[str] = None
 
 
 def teacher_weight(teacher: TeacherConfig, step: int) -> float:
@@ -251,6 +260,10 @@ def validate(cfg: ExperimentConfig) -> None:
             raise ValueError(f"teacher {t.name}: dim must be positive")
         if t.weight < 0:
             raise ValueError(f"teacher {t.name}: weight must be >= 0")
+        if t.query_prefix and not t.query_sources:
+            raise ValueError(f"teacher {t.name}: query_prefix needs query_sources (JSONL files with a `question` field)")
+        if t.reuse_plain_from is not None and (not t.query_prefix or t.reuse_plain_from == t.name):
+            raise ValueError(f"teacher {t.name}: reuse_plain_from needs a query_prefix and another teacher's name")
         if t.weight_start is not None:
             if t.weight_start < 0:
                 raise ValueError(f"teacher {t.name}: weight_start must be >= 0")
