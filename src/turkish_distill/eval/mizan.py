@@ -61,6 +61,25 @@ CATEGORY_ORDER = ["Classification", "Retrieval", "PairClassification", "Clusteri
 _RUN_PROTOCOL = ("model", "revision", "dtype", "max_seq_length", "prompts", "normalize")
 
 
+def patch_transformers_for_mteb(module=None) -> bool:
+    """Let `import mteb` (1.38.x) work with transformers 5.
+
+    One of mteb's model modules does `from transformers import AutoModelForVision2Seq`; transformers 5 removed that name
+    (it was merged into `AutoModelForImageTextToText`), which makes `import mteb` fail with an ImportError before any
+    task is touched. It is the only transformers name of the 15 that mteb 1.38.51 imports that is missing in
+    transformers 5.20.1 (checked against the source of both). Returns True when the alias was added. Call it BEFORE
+    `import mteb`; `run_evaluation` does."""
+    if module is None:
+        import transformers as module
+    if hasattr(module, "AutoModelForVision2Seq"):
+        return False
+    replacement = getattr(module, "AutoModelForImageTextToText", None)
+    if replacement is None:
+        return False
+    module.AutoModelForVision2Seq = replacement
+    return True
+
+
 def summarize_scores(task_scores: dict[str, dict]) -> dict:
     known = {t: v["score"] for t, v in task_scores.items() if t in TASK_CATEGORIES}
     by_category: dict[str, list[float]] = {c: [] for c in CATEGORY_ORDER}
@@ -162,6 +181,7 @@ def run_evaluation(
     dtypes = ("float32", "float16", "bfloat16")
     if dtype not in dtypes:
         raise ValueError(f"dtype must be one of {dtypes}, got {dtype!r}")
+    patch_transformers_for_mteb()
     try:
         import mteb
         from mteb import MTEB

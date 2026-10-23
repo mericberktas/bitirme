@@ -49,3 +49,13 @@ def test_run_evaluation_validates_its_arguments_before_importing_mteb(tmp_path):
         mizan.run_evaluation("some/model", tmp_path, task_names=["NotATask"])
     with pytest.raises(ValueError, match="dtype"):
         mizan.run_evaluation("some/model", tmp_path, dtype="int8")
+
+
+def test_transformers_5_alias_for_mteb():
+    from types import SimpleNamespace
+
+    new_style = SimpleNamespace(AutoModelForImageTextToText=object())  # transformers 5: the old name is gone
+    assert mizan.patch_transformers_for_mteb(new_style) is True and new_style.AutoModelForVision2Seq is new_style.AutoModelForImageTextToText
+    old_style = SimpleNamespace(AutoModelForVision2Seq="old")  # transformers 4: nothing to do
+    assert mizan.patch_transformers_for_mteb(old_style) is False and old_style.AutoModelForVision2Seq == "old"
+    assert mizan.patch_transformers_for_mteb(SimpleNamespace()) is False  # neither name: leave it to mteb's own error
