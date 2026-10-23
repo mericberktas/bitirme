@@ -1,0 +1,112 @@
+# Distillation corpus mix, version 2: the same bucket proportions as v1, filled from more and more varied sources.
+#
+# Why v2: v1 (70K) drew 75% of its texts from one web crawl (Cosmos) and 25% from three QA datasets. Scaling it up
+# (200K, 500K) with the SAME proportions needs more raw material of each kind than those two sources hold, and the
+# data survey (arastirma/ek_veri_arastirmasi.md) found open Turkish sources that fit the gaps: Wikipedia (clean
+# paragraphs, sentences, article leads), news headlines and articles (MLSUM, XL-Sum, news-tr-1.8M), TaPaCo (short
+# sentences), MQA/MFAQ (informal community questions and answers). Cosmos stays at 16% for web diversity.
+# The proportions per kind are unchanged (short 32%, paragraphs 22%, informal 13%, long 8%, questions 10%,
+# encyclopedic intros 15%), so a 70K / 200K / 500K comparison changes the amount and the variety of the data but not
+# the recipe. The split inside a kind between the sources is a hypothesis, like the shares themselves.
+#
+# 1) python -m turkish_distill.prepare_extra            (data/extra -> data/extra/prepared, caps the rows per site)
+# 2) python -m turkish_distill.build_mix --config configs/data_mix_v2.yaml --forbidden data/benchmark_texts.jsonl \
+#        --out data/mix/mix_v2_500k.jsonl --target-total 500000
+# 3) python -m turkish_distill.build_mix --config configs/data_mix_v2.yaml --target-total 200000 \
+#        --subsample-from data/mix/mix_v2_500k.jsonl --out data/mix/mix_v2_200k.jsonl      (a SUBSET of the 500K mix)
+
+name: mix_v2
+seed: 42
+target_total: 500000
+oversample: 1.5
+
+sources:
+  cosmos:
+    type: jsonl
+    path: data/cosmos/corpus_clean.jsonl
+  qa:
+    type: pairs
+    path: data/stage1/pairs_train.jsonl
+  wikipedia:
+    type: jsonl
+    path: data/extra/prepared/wikipedia.jsonl
+  wikipedia_leads:
+    type: jsonl
+    path: data/extra/prepared/wikipedia_leads.jsonl
+  news:
+    type: jsonl
+    path: data/extra/prepared/news.jsonl
+  news_titles:
+    type: jsonl
+    path: data/extra/prepared/news_titles.jsonl
+  tapaco:
+    type: jsonl
+    path: data/extra/prepared/tapaco.jsonl
+  mqa_questions:
+    type: jsonl
+    path: data/extra/prepared/mqa_questions.jsonl
+  mqa_answers:
+    type: jsonl
+    path: data/extra/prepared/mqa_answers.jsonl
+  mfaq_questions:
+    type: jsonl
+    path: data/extra/prepared/mfaq_questions.jsonl
+
+buckets:
+  # ---- short, well-formed sentences (32%): NLI, STS, sentiment, offensive/irony, bitext
+  - {name: short_headlines, source: news_titles, transform: whole, share: 0.10, min_chars: 25, max_chars: 150, allow_shortfall: true}
+  - {name: short_tapaco, source: tapaco, transform: whole, share: 0.10, min_chars: 30, max_chars: 150, allow_shortfall: true}
+  # a sentence must end with sentence punctuation: Wikipedia lines include section headings
+  - name: short_wiki_sentences
+    source: wikipedia
+    transform: sentences
+    share: 0.06
+    min_chars: 40
+    max_chars: 150
+    include_regex: '[.!?…]["”’)]?$'
+    exclude_regex: '//|\bISBN\b|\bdoi\b|\bss?\. ?\d+ ?[-–] ?\d+|\bBkz\b|\bAyrıca bakınız\b'   # bibliography and "see also" lines
+  - {name: short_cosmos_sentences, source: cosmos, transform: sentences, share: 0.06, min_chars: 30, max_chars: 150}
+  # ---- paragraph-sized text (22%): topic classification, QA passages
+  - name: wiki_paragraphs
+    source: wikipedia
+    transform: lines
+    share: 0.08
+    min_chars: 150
+    max_chars: 600
+    include_regex: '[.!?…]["”’)]?$'
+    exclude_regex: '//|\bISBN\b|\bdoi\b|\bss?\. ?\d+ ?[-–] ?\d+|\bBkz\b|\bAyrıca bakınız\b'   # bibliography and "see also" lines
+    max_per_doc: 2
+  - {name: news_paragraphs, source: news, transform: lines, share: 0.08, min_chars: 150, max_chars: 600, max_per_doc: 2}
+  - {name: cosmos_paragraphs, source: cosmos, transform: lines, share: 0.06, min_chars: 150, max_chars: 600}
+  # ---- informal (13%): community answers (MQA) and the keyword-selected Cosmos segments of v1
+  # templated doctor-promotion answers ("... doktorumuzun ... cevaplarini goruntuleyin") are not user text
+  - name: informal_answers
+    source: mqa_answers
+    transform: whole
+    share: 0.09
+    min_chars: 50
+    max_chars: 500
+    exclude_regex: 'doktorumuz|görüntüleyin|randevu al'
+  - name: informal_cosmos
+    source: cosmos
+    transform: lines
+    share: 0.04
+    min_chars: 50
+    max_chars: 400
+    include_regex: '\b(arkadaşlar|merhaba|selam|teşekkürler|teşekkür ederim|bence|sizce|acaba|sorunum|tavsiye|şikayet|memnun|berbat|harika|kesinlikle|yardımcı olur musunuz)\b'
+  # ---- long passages (8%): clustering, long retrieval documents
+  - name: wiki_long
+    source: wikipedia
+    transform: lines
+    share: 0.04
+    min_chars: 800
+    max_chars: 1500
+    include_regex: '[.!?…]["”’)]?$'
+    exclude_regex: '//|\bISBN\b|\bdoi\b|\bss?\. ?\d+ ?[-–] ?\d+|\bBkz\b|\bAyrıca bakınız\b'   # bibliography and "see also" lines
+  - {name: cosmos_long, source: cosmos, transform: whole, share: 0.04, min_chars: 800, max_chars: 1500}
+  # ---- questions (10%): retrieval queries
+  - {name: questions_cqa, source: mqa_questions, transform: whole, share: 0.05, min_chars: 15, max_chars: 200}
+  - {name: questions_mfaq, source: mfaq_questions, transform: whole, share: 0.02, min_chars: 15, max_chars: 200, allow_shortfall: true}
+  - {name: questions_qa, source: qa, transform: questions, share: 0.03, min_chars: 15, max_chars: 200, allow_shortfall: true}
+  # ---- encyclopedic introductions (15%): hard retrieval
+  - {name: wiki_leads, source: wikipedia_leads, transform: whole, share: 0.15, min_chars: 150, max_chars: 1200}

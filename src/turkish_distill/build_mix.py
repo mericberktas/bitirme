@@ -352,7 +352,7 @@ def build_mix(cfg: MixConfig, out_path: str | Path, forbidden: Optional[str | Pa
                 contaminated += 1
             else:
                 taken.add(key)
-                accepted.append({**item, "bucket": b.name})
+                accepted.append({**item, "bucket": b.name, "rank": len(accepted)})
         lengths = sorted(len(x["text"]) for x in accepted)
         domains = collections.Counter(_domain(x.get("url")) for x in accepted if x.get("url"))
         stats["buckets"][b.name] = {
@@ -382,6 +382,74 @@ def build_mix(cfg: MixConfig, out_path: str | Path, forbidden: Optional[str | Pa
     return stats
 
 
+def subsample_mix(mix_path: str | Path, cfg: MixConfig, target_total: int, out_path: str | Path) -> dict:
+    """A smaller mix that is a SUBSET of an already built one: every bucket keeps its first `share x target_total`
+    texts (`rank` is the position in the bucket's accepted order, which is a random order). A 200K mix taken out of
+    a 500K mix has the same bucket proportions and only the amount of data differs, so a scaling comparison is not
+    confounded by a different sample."""
+    quotas = {b.name: round(b.share * target_total) for b in cfg.buckets}
+    kept: list[dict] = []
+    with open(mix_path, encoding="utf-8") as f:
+        for line in f:
+            row = json.loads(line)
+            if row["rank"] < quotas.get(row["bucket"], 0):
+                kept.append(row)
+    random.Random(f"{cfg.seed}|subsample|{target_total}").shuffle(kept)
+    counts = collections.Counter(r["bucket"] for r in kept)
+    stats = {"name": f"{cfg.name}_{target_total}", "subset_of": str(mix_path), "target_total": target_total, "total": len(kept),
+             "buckets": {b: {"quota": quotas[b], "selected": counts.get(b, 0)} for b in quotas}}
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_name(out_path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        for row in kept:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    os.replace(tmp, out_path)
+    out_path.with_suffix(".mix.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
+    return stats
+
+
+def refilter_mix(mix_path: str | Path, forbidden: str | Path, out_path: str | Path, seed: int = 42) -> dict:
+    """Drop the texts of an already built mix that copy a benchmark text of ANOTHER forbidden list (for example
+    Mizan's test texts after the mix was built against TR-MTEB's). Ranks are renumbered inside every bucket in the
+    original order, so `subsample_mix` still takes exactly the first `share x target` surviving texts of a bucket."""
+    from .decontaminate_corpus import BenchmarkIndex, _dataset_names_and_bounds, _iter_texts
+
+    forbidden = Path(forbidden)
+    names, bounds = _dataset_names_and_bounds(forbidden)
+    index = BenchmarkIndex(_iter_texts(forbidden), bounds, 13)
+    by_bucket: dict[str, list[dict]] = collections.defaultdict(list)
+    removed: collections.Counter = collections.Counter()
+    removed_by_benchmark: collections.Counter = collections.Counter()
+    total = 0
+    with open(mix_path, encoding="utf-8") as f:
+        for line in f:
+            row = json.loads(line)
+            total += 1
+            shared, dataset, exact = index.check(row["text"])
+            if exact or shared >= 1:
+                removed[row["bucket"]] += 1
+                removed_by_benchmark[names[dataset if dataset is not None else 0]] += 1
+            else:
+                by_bucket[row["bucket"]].append(row)
+    kept: list[dict] = []
+    for bucket, rows in by_bucket.items():
+        rows.sort(key=lambda r: r["rank"])
+        kept += [{**r, "rank": i} for i, r in enumerate(rows)]
+    random.Random(f"{seed}|refilter").shuffle(kept)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_name(out_path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        for row in kept:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    os.replace(tmp, out_path)
+    stats = {"input": str(mix_path), "forbidden": str(forbidden), "rows_in": total, "rows_out": len(kept),
+             "removed_per_bucket": dict(removed), "removed_by_first_matching_dataset": dict(removed_by_benchmark.most_common())}
+    out_path.with_suffix(".refilter.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
+    return stats
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Build a mixed distillation corpus with a quota per bucket")
     parser.add_argument("--config", required=True)
@@ -389,11 +457,20 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--forbidden", default=None, help="benchmark_texts.jsonl: drop copies of benchmark test texts")
     parser.add_argument("--source", action="append", default=[], help="name=path: replace a source's path (repeatable)")
     parser.add_argument("--target-total", type=int, default=None, help="replace target_total (the shares stay)")
+    parser.add_argument("--subsample-from", default=None, help="an already built mix (with `rank`): write a subset of it of --target-total texts")
+    parser.add_argument("--refilter-from", default=None, help="an already built mix: drop copies of the texts in --forbidden and write the rest to --out")
     args = parser.parse_args(argv)
     overrides = dict(item.split("=", 1) for item in args.source)
     cfg = load_mix_config(args.config, overrides)
     if args.target_total is not None:
         cfg.target_total = args.target_total
+    if args.refilter_from:
+        print(json.dumps(refilter_mix(args.refilter_from, args.forbidden, args.out, cfg.seed), ensure_ascii=False, indent=2))
+        return
+    if args.subsample_from:
+        stats = subsample_mix(args.subsample_from, cfg, cfg.target_total, args.out)
+        print(json.dumps(stats, ensure_ascii=False, indent=2))
+        return
     stats = build_mix(cfg, args.out, args.forbidden)
     print(json.dumps(stats, ensure_ascii=False, indent=2))
 
