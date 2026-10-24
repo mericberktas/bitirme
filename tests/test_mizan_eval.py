@@ -59,3 +59,18 @@ def test_transformers_5_alias_for_mteb():
     old_style = SimpleNamespace(AutoModelForVision2Seq="old")  # transformers 4: nothing to do
     assert mizan.patch_transformers_for_mteb(old_style) is False and old_style.AutoModelForVision2Seq == "old"
     assert mizan.patch_transformers_for_mteb(SimpleNamespace()) is False  # neither name: leave it to mteb's own error
+
+
+def test_http_sessions_get_a_larger_header_limit_once():
+    created = []
+
+    class Session:
+        def __init__(self, *args, **kwargs):
+            created.append(kwargs)
+
+    assert mizan.allow_long_http_headers(Session, limit=1234) is True
+    Session(timeout=5)
+    assert created[-1] == {"timeout": 5, "max_field_size": 1234, "max_line_size": 1234}
+    Session(max_field_size=99)  # an explicit value of the caller wins
+    assert created[-1]["max_field_size"] == 99 and created[-1]["max_line_size"] == 1234
+    assert mizan.allow_long_http_headers(Session, limit=1234) is False  # not wrapped a second time

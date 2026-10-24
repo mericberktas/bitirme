@@ -68,8 +68,18 @@ def patch_transformers_for_mteb(module=None) -> bool:
     (it was merged into `AutoModelForImageTextToText`), which makes `import mteb` fail with an ImportError before any
     task is touched. It is the only transformers name of the 15 that mteb 1.38.51 imports that is missing in
     transformers 5.20.1 (checked against the source of both). Returns True when the alias was added. Call it BEFORE
-    `import mteb`; `run_evaluation` does."""
+    `import mteb`; `run_evaluation` does.
+
+    The alias must be set AFTER `sentence_transformers` has been imported: importing it makes transformers 5 replace
+    its own module object in `sys.modules` (measured in the Mizan environment: the module id changes while
+    `transformers.video_processing_utils` loads), which silently drops an alias set earlier, and `import mteb`
+    (which imports sentence_transformers) then fails with the same ImportError although the patch reported success.
+    So the function imports sentence_transformers first (mteb needs it anyway)."""
     if module is None:
+        try:
+            import sentence_transformers  # noqa: F401
+        except ImportError:
+            pass
         import transformers as module
     if hasattr(module, "AutoModelForVision2Seq"):
         return False
@@ -77,6 +87,35 @@ def patch_transformers_for_mteb(module=None) -> bool:
     if replacement is None:
         return False
     module.AutoModelForVision2Seq = replacement
+    return True
+
+
+def allow_long_http_headers(session_cls=None, limit: int = 65536) -> bool:
+    """Raise aiohttp's default limit on response header size (8190 bytes) for every new `ClientSession`.
+
+    `apple/mkqa` is a loading script that downloads `mkqa.jsonl.gz` from github.com; GitHub's redirect answers with a
+    Content-Security-Policy header longer than 8190 bytes, aiohttp refuses it ("Got more than 8190 bytes") and
+    `MKQARetrieval.load_data` raises FileNotFoundError. mteb lets that exception end the whole run, so every task after
+    MKQARetrieval (XNLI, XNLIV2, SIB200 clustering, STS22.v2) is skipped. datasets passes its own `client_kwargs` to
+    fsspec, which replaces an fsspec-level config, so the default is set on the session class itself. Returns True when
+    the patch was installed (False when aiohttp is missing or it was installed before)."""
+    if session_cls is None:
+        try:
+            import aiohttp
+        except ImportError:
+            return False
+        session_cls = aiohttp.ClientSession
+    init = session_cls.__init__
+    if getattr(init, "_long_headers_patch", False):
+        return False
+
+    def patched(self, *args, **kwargs):
+        kwargs.setdefault("max_field_size", limit)
+        kwargs.setdefault("max_line_size", limit)
+        init(self, *args, **kwargs)
+
+    patched._long_headers_patch = True
+    session_cls.__init__ = patched
     return True
 
 
@@ -182,6 +221,7 @@ def run_evaluation(
     if dtype not in dtypes:
         raise ValueError(f"dtype must be one of {dtypes}, got {dtype!r}")
     patch_transformers_for_mteb()
+    allow_long_http_headers()
     try:
         import mteb
         from mteb import MTEB
