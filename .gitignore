@@ -44,3 +44,7 @@ Thumbs.db
 rapor/
 arastirma/
 rapor_güncel/
+
+# Scripts driven from this machine through the `colab` CLI (VM setup, rclone mount, launching runs): local only.
+# Notebooks that are run in the Colab web UI live in notebooks/ and are tracked.
+colab_cli/
