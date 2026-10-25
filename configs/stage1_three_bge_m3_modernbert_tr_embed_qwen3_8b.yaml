@@ -1,0 +1,89 @@
+# Stage 1: three teachers, BGE-M3 + the lab's 8K embedding model (modernbert-tr-embed) + Qwen3-Embedding-8B, equal weights.
+# On the 200K mix the per-task oracle of BGE-M3 + 8K-embed is 68.92; Qwen3-8B adds the most of any third teacher
+# (+1.57 oracle), the next ones are Qwen3-4B (+0.94) and EmbeddingGemma (+0.43). Whether the oracle gain turns into a
+# real gain for a student distilled from all three is what this config tests (the plain BGE + 8K pair reaches 66.71 at
+# 5400 steps). Qwen3-8B alone gave a weaker student (61.05) than BGE-M3 (62.72) on the QA texts; the weights are an
+# open question (--override teachers.2.weight=0.5 makes Qwen count less).
+#   teachers.0 = bge_m3     teachers.1 = modernbert_tr_embed     teachers.2 = qwen3_8b
+# Also the config for ENCODING Qwen3-8B on the 200K mix (notebooks/colab_encode.ipynb: TEACHERS = ['qwen3_8b'],
+# CORPUS_PATH = the 200K mix; ~8.7 h on an L4, resumable at shard level). The other two teachers' caches exist.
+# Intended use:
+#   --override data.corpus_path=/content/drive/MyDrive/bitirme/data/mix/mix_v2_200k.jsonl --override name=scale_three_mix200k_s5400 --override train.max_steps=5400
+
+name: stage1_three_bge_m3_modernbert_tr_embed_qwen3_8b
+output_dir: /content/drive/MyDrive/bitirme/runs
+local_tmp_dir: /content/ckpt_staging
+tensorboard: true
+
+teachers:
+  - name: bge_m3
+    hf_id: BAAI/bge-m3
+    revision: 5617a9f61b028005a4858fdac845db406aefb181
+    dim: 1024
+    doc_prefix: ""
+    max_length: 512
+    batch_size: 64
+    dtype: float16
+    weight: 1.0
+  - name: modernbert_tr_embed
+    hf_id: ytu-ce-cosmos/modernbert-tr-embed
+    revision: 855820e0079102805908d60d32cd9fd59c970b80
+    dim: 768
+    doc_prefix: ""
+    max_length: 512
+    batch_size: 64
+    dtype: float32
+    weight: 1.0
+  - name: qwen3_8b
+    hf_id: Qwen/Qwen3-Embedding-8B
+    revision: 1d8ad4ca9b3dd8059ad90a75d4983776a23d44af
+    dim: 4096
+    doc_prefix: ""
+    max_length: 512
+    batch_size: 32
+    dtype: bfloat16
+    weight: 1.0
+
+student:
+  hf_id: ytu-ce-cosmos/modernbert-tr-base-1k
+  revision: c2e35f553101cce5b03fbb318ef8728473fd34dd
+  max_length: 512
+  pooling: mean
+
+data:
+  corpus_path: /content/drive/MyDrive/bitirme/data/stage1/corpus_train.jsonl
+  text_column: text
+  cache_dir: /content/drive/MyDrive/bitirme/cache/teachers
+  shard_size: 10000
+  max_samples: null
+  min_chars: 10
+  val_size: 2000
+
+loss:
+  cosine_weight: 10.0
+  sim_weight: 200.0
+  resim_weight: 20.0
+  resim_margin: 0.015
+  resim_num_samples: 4096
+  gor_weight: 0.0
+
+train:
+  batch_size: 128
+  chunk_size: 32             # gradient caching: same maths, memory of 32 texts (null ran out of memory on an L4)
+  lr: 5.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_steps: 1800
+  grad_clip: 1.0
+  bf16: true
+  seed: 42
+  num_workers: 2
+  log_every: 25
+  diag_every: 300
+  ckpt_every: 300
+  keep_last: 2
+
+eval:
+  sts_dataset: null
+  pairs_val: /content/drive/MyDrive/bitirme/data/stage1/pairs_val.jsonl
+  query_max_length: 64

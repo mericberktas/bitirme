@@ -1,0 +1,69 @@
+# Second round: the student of the plain BGE-M3 + 8K-embed run (TR-MTEB 66.71, 5400 steps) becomes the single teacher
+# of a fresh student started from modernbert-tr-base-1k again (Born-Again style, one more round). The teacher is the
+# `final/` folder of that run on Drive, loaded like any sentence-transformers model (transformer + mean pooling, vectors
+# are L2-normalised when cached, as for every teacher). Its vectors for the 200K mix are cheap to cache (150M model).
+# Cost / benefit: no new information enters (the teacher already merges BGE-M3 and 8K-embed), so a gain would come from
+# distilling the merged model's smoother targets; Lee et al. (ICLR 2023) found most of a self-distillation gain in the
+# first round. Intended use:
+#   --override data.corpus_path=/content/drive/MyDrive/bitirme/data/mix/mix_v2_200k.jsonl --override name=round2_from_two_s5400 --override train.max_steps=5400
+# The plain-run folder name is the run id; change it to distil from another student (e.g. an upload of the soup).
+
+name: stage2_single_two_teacher_student
+output_dir: /content/drive/MyDrive/bitirme/runs
+local_tmp_dir: /content/ckpt_staging
+tensorboard: true
+
+teachers:
+  - name: two_teacher_student
+    hf_id: /content/drive/MyDrive/bitirme/runs/scale_two_bge_8k_mix200k_s5400/20261024-125800-dad457c/final
+    revision: null
+    dim: 768
+    doc_prefix: ""
+    max_length: 512
+    batch_size: 64
+    dtype: float32
+    weight: 1.0
+
+student:
+  hf_id: ytu-ce-cosmos/modernbert-tr-base-1k
+  revision: c2e35f553101cce5b03fbb318ef8728473fd34dd
+  max_length: 512
+  pooling: mean
+
+data:
+  corpus_path: /content/drive/MyDrive/bitirme/data/stage1/corpus_train.jsonl
+  text_column: text
+  cache_dir: /content/drive/MyDrive/bitirme/cache/teachers
+  shard_size: 10000
+  max_samples: null
+  min_chars: 10
+  val_size: 2000
+
+loss:
+  cosine_weight: 10.0
+  sim_weight: 200.0
+  resim_weight: 20.0
+  resim_margin: 0.015
+  resim_num_samples: 4096
+  gor_weight: 0.0
+
+train:
+  batch_size: 128
+  chunk_size: 32
+  lr: 5.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_steps: 1800
+  grad_clip: 1.0
+  bf16: true
+  seed: 42
+  num_workers: 2
+  log_every: 25
+  diag_every: 300
+  ckpt_every: 300
+  keep_last: 2
+
+eval:
+  sts_dataset: null
+  pairs_val: /content/drive/MyDrive/bitirme/data/stage1/pairs_val.jsonl
+  query_max_length: 64
