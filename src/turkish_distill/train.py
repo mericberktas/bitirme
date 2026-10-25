@@ -15,6 +15,7 @@ from typing import Any, Optional
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from .checkpoint import cleanup_stale, latest_checkpoint, load_checkpoint, save_checkpoint
 from .config import ExperimentConfig, TeacherConfig, dump_config, load_config, teacher_weight
@@ -229,6 +230,8 @@ def run_training(
         )
 
     last_saved = step
+    # One line every ~20 s (carriage-return updates in a notebook cell): step, speed, time left, the latest loss and validation MRR.
+    bar = tqdm(total=t.max_steps, initial=step, desc=cfg.name, mininterval=20, smoothing=0.05, dynamic_ncols=True)
     while step < t.max_steps:
         epoch, offset = divmod(step, steps_per_epoch)
         batches = epoch_batches(train_idx, t.batch_size, t.seed, epoch, offset)
@@ -250,8 +253,10 @@ def run_training(
             window["grad_norm"] = window.get("grad_norm", 0.0) + float(grad_norm)
             window_count += 1
             last_logs = logs
+            bar.update(1)
 
             if step % t.log_every == 0 or step == t.max_steps:
+                bar.set_postfix(loss=f"{window['total'] / window_count:.4f}" if "total" in window else None, refresh=False)
                 elapsed = max(time.time() - window_start, 1e-9)
                 record = {k: v / window_count for k, v in window.items()}
                 record["lr"] = scheduler.get_last_lr()[0]
@@ -268,6 +273,7 @@ def run_training(
             if step >= t.max_steps:
                 break
 
+    bar.close()
     if last_saved != step:
         save(step)
     model.save_backbone(run_dir / "final", tokenizer)
