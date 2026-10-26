@@ -20,13 +20,13 @@ from tqdm.auto import tqdm
 from .checkpoint import cleanup_stale, latest_checkpoint, load_checkpoint, save_checkpoint
 from .config import ExperimentConfig, TeacherConfig, dump_config, load_config, teacher_weight
 from .contrastive import _capture_rng, _restore_rng, evaluate_retrieval, load_pairs
-from .data import Collator, ListDataset, epoch_batches, load_corpus
+from .data import Collator, ListDataset, epoch_batches, load_corpus, neighbor_epoch_batches
 from .diagnostics import effective_rank, geometry_agreement, mean_pairwise_cosine, teacher_cosine
 from .eval.sts import evaluate_sts, load_sts_pairs, make_student_encode_fn
 from .logging_utils import MetricsLogger
 from .losses import MultiTeacherLoss
 from .models import StudentEncoder
-from .targets import ArrayCache, CenteredCache, PCACache, fuse_teachers, geometry_report
+from .targets import ArrayCache, CenteredCache, PCACache, cached_neighbor_clusters, fuse_teachers, geometry_report
 from .teachers import TeacherCache, corpus_fingerprint
 from .utils import describe_device, get_device, git_sha, set_seed, write_env_info
 
@@ -148,6 +148,7 @@ def run_training(
     sts_data: Optional[tuple[list[str], list[str], list[float]]] = None,
     resume: bool = True,
     retrieval_val: Optional[dict[str, list[str]]] = None,
+    neighbor_labels: Optional[np.ndarray] = None,
 ) -> dict[str, Any]:
     run_dir = Path(run_dir)
     ckpt_dir = run_dir / "checkpoints"
@@ -234,7 +235,12 @@ def run_training(
     bar = tqdm(total=t.max_steps, initial=step, desc=cfg.name, mininterval=20, smoothing=0.05, dynamic_ncols=True)
     while step < t.max_steps:
         epoch, offset = divmod(step, steps_per_epoch)
-        batches = epoch_batches(train_idx, t.batch_size, t.seed, epoch, offset)
+        if neighbor_labels is not None and t.neighbor_fraction > 0:
+            batches = neighbor_epoch_batches(
+                train_idx, neighbor_labels, t.batch_size, t.seed, epoch, t.neighbor_fraction, t.neighbor_group_size, offset
+            )
+        else:
+            batches = epoch_batches(train_idx, t.batch_size, t.seed, epoch, offset)
         loader = DataLoader(ListDataset(batches), batch_size=None, collate_fn=collator, num_workers=t.num_workers)
         for batch in loader:
             input_ids = batch["input_ids"].to(device)
@@ -344,6 +350,17 @@ def main(argv: Optional[list[str]] = None) -> None:
     texts = load_corpus(cfg.data, cfg.train.seed)
     fingerprint = corpus_fingerprint(texts)
     caches = {t.name: TeacherCache.open(cfg.data.cache_dir, t, fingerprint, len(texts)) for t in cfg.teachers}
+    neighbor_labels = None
+    if cfg.train.neighbor_fraction > 0:
+        active = {t.name: caches[t.name] for t in cfg.teachers if teacher_weight(t, 0) > 0}
+        n_clusters = cfg.train.neighbor_clusters or max(2, len(texts) // cfg.train.neighbor_group_size)
+        neighbor_labels = cached_neighbor_clusters(active, cfg.data.cache_dir, fingerprint, n_clusters, cfg.train.neighbor_iters)
+        sizes = np.bincount(neighbor_labels)
+        print(
+            f"neighbour batches: {cfg.train.neighbor_fraction:.2f} of every batch in groups of {cfg.train.neighbor_group_size}; "
+            f"{int((sizes > 0).sum())} clusters, size median {int(np.median(sizes[sizes > 0]))}, max {int(sizes.max())}",
+            flush=True,
+        )
     cfg, caches = apply_target_methods(cfg, caches)
     tokenizer = AutoTokenizer.from_pretrained(cfg.student.hf_id, revision=cfg.student.revision)
     model = StudentEncoder.from_pretrained(cfg.student, cfg.teachers)
@@ -361,7 +378,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     print(f"device: {describe_device(get_device())}", flush=True)
     result = run_training(
         cfg, run_dir, model, tokenizer, texts, caches, get_device(), sts_data=sts_data, resume=not args.no_resume,
-        retrieval_val=retrieval_val,
+        retrieval_val=retrieval_val, neighbor_labels=neighbor_labels,
     )
     print(result, flush=True)
 

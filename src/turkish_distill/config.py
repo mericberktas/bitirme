@@ -158,6 +158,18 @@ class TrainConfig:
     diag_every: int = 500
     ckpt_every: int = 1000
     keep_last: int = 2
+    # Neighbour-rich batches (0 = plain random batches): this fraction of every batch is made of groups of
+    # `neighbor_group_size` texts from one cluster of the teachers' joint vector space (spherical k-means with
+    # `neighbor_clusters` clusters, `neighbor_iters` iterations, computed once per corpus and teacher set and cached next
+    # to the teacher caches), the rest is random. In a random batch of 128 almost no text has a real nearest neighbour,
+    # which makes the neighbour-based terms (listwise, ranking) see mostly easy negatives.
+    # `neighbor_clusters` 0 = automatic: corpus size / group size (clusters about as large as a group measured best: on a
+    # 10K shard the share of a text's true top-10 neighbours that are in its batch rose from 0.012 (random) to 0.065
+    # with fraction 0.5; clusters of ~100 gave only 0.024).
+    neighbor_fraction: float = 0.0
+    neighbor_group_size: int = 8
+    neighbor_clusters: int = 0
+    neighbor_iters: int = 10
 
 
 @dataclass
@@ -300,6 +312,15 @@ def validate(cfg: ExperimentConfig) -> None:
         raise ValueError("train.batch_size must be >= 2 (similarity losses need pairs)")
     if cfg.train.chunk_size is not None and cfg.train.chunk_size < 1:
         raise ValueError("train.chunk_size must be >= 1 or null")
+    tr = cfg.train
+    if not 0.0 <= tr.neighbor_fraction <= 1.0:
+        raise ValueError("train.neighbor_fraction must be in [0, 1]")
+    if tr.neighbor_fraction > 0 and not (
+        2 <= tr.neighbor_group_size <= tr.batch_size and (tr.neighbor_clusters == 0 or tr.neighbor_clusters >= 2) and tr.neighbor_iters >= 1
+    ):
+        raise ValueError(
+            "neighbour batches need 2 <= neighbor_group_size <= batch_size, neighbor_clusters 0 (auto) or >= 2, neighbor_iters >= 1"
+        )
     if cfg.loss.gram_target_std <= 0:
         raise ValueError("loss.gram_target_std must be positive")
     if cfg.loss.listwise_weight < 0 or cfg.loss.listwise_temperature <= 0:

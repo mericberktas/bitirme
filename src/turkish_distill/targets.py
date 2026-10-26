@@ -2,6 +2,7 @@
 
 * `CenteredCache` (method a): subtract the corpus mean of a teacher's vectors and re-normalise.
 * `PCACache`: keep only the top principal components of a teacher's vectors (what a student of that size can represent).
+* `neighbor_clusters`: cluster labels of the corpus from the teachers' vectors, for neighbour-rich batches.
 * `fuse_teachers` (method d): reduce every teacher to a common number of PCA components, rotate them onto one
   reference teacher with an orthogonal Procrustes fit and average the aligned unit vectors into a single target.
 
@@ -78,6 +79,64 @@ class PCACache:
         x = self.cache.get(indices)
         centred = x - self.mean
         return _unit(self.mean + (centred @ self.basis) @ self.basis.T)
+
+
+def neighbor_clusters(
+    caches: dict,
+    n_clusters: int,
+    iters: int = 10,
+    seed: int = 0,
+    proj_dim: int = 128,
+    chunk: int = CHUNK,
+) -> np.ndarray:
+    """Cluster label of every corpus text, from the teachers' vectors (spherical k-means).
+
+    Each teacher's unit vectors are mapped to `proj_dim` dimensions with a fixed Gaussian random projection (keeps the
+    cosines approximately), the projections of all teachers are concatenated with equal weight and re-normalised, and
+    spherical k-means runs on that: texts in one cluster are neighbours for the teachers together, so a batch built
+    from a few clusters has real nearest neighbours for the neighbour-distribution (listwise) loss.
+    """
+    names = sorted(caches)
+    n = len(caches[names[0]])
+    rng = np.random.default_rng(seed)
+    projections = {k: rng.normal(size=(caches[k].dim, proj_dim)).astype(np.float32) / np.sqrt(proj_dim) for k in names}
+    z = np.empty((n, proj_dim * len(names)), dtype=np.float32)
+    for lo in range(0, n, chunk):
+        idx = np.arange(lo, min(lo + chunk, n))
+        z[idx] = np.concatenate([_unit(caches[k].get(idx)) @ projections[k] for k in names], axis=1)
+    z = _unit(z)
+    centres = z[rng.choice(n, size=n_clusters, replace=False)].copy()
+    labels = np.zeros(n, dtype=np.int64)
+    for _ in range(iters):
+        for lo in range(0, n, chunk):
+            labels[lo : lo + chunk] = np.argmax(z[lo : lo + chunk] @ centres.T, axis=1)
+        sums = np.zeros_like(centres)
+        np.add.at(sums, labels, z)
+        empty = np.linalg.norm(sums, axis=1) < 1e-8
+        sums[empty] = z[rng.choice(n, size=int(empty.sum()), replace=False)] if empty.any() else sums[empty]
+        centres = _unit(sums)
+    for lo in range(0, n, chunk):
+        labels[lo : lo + chunk] = np.argmax(z[lo : lo + chunk] @ centres.T, axis=1)
+    return labels
+
+
+def cached_neighbor_clusters(caches: dict, cache_dir: str, fingerprint: str, n_clusters: int, iters: int, seed: int = 0) -> np.ndarray:
+    """`neighbor_clusters`, computed once per (corpus, teacher set, settings) and stored next to the teacher caches."""
+    import os
+    from pathlib import Path
+
+    names = "+".join(sorted(caches))
+    path = Path(cache_dir) / "neighbor_clusters" / f"{fingerprint}_{names}_k{n_clusters}_i{iters}_s{seed}.npy"
+    if path.exists():
+        labels = np.load(path)
+        if len(labels) == len(next(iter(caches.values()))):
+            return labels
+    labels = neighbor_clusters(caches, n_clusters, iters, seed)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp.npy")
+    np.save(tmp, labels)
+    os.replace(tmp, path)
+    return labels
 
 
 class ArrayCache:

@@ -2,6 +2,7 @@
 
 import copy
 
+import numpy as np
 import pytest
 import torch
 
@@ -161,7 +162,7 @@ def test_training_runs_with_only_the_vector_term_or_only_the_relation_terms(expe
 
 @pytest.mark.parametrize(
     "method",
-    ["center", "gram_standardize", "shared_relation", "fusion", "pca", "listwise"],
+    ["center", "gram_standardize", "shared_relation", "fusion", "pca", "listwise", "neighbor"],
 )
 def test_training_runs_with_each_target_method(experiment, tmp_path, method):
     """Methods a-d run through the real loop (heads, loss, diagnostics, checkpoints) and stay finite."""
@@ -181,6 +182,10 @@ def test_training_runs_with_each_target_method(experiment, tmp_path, method):
         cfg.loss.relation_mode = "shared"
     elif method == "listwise":
         cfg.loss.listwise_weight = 5.0
+    elif method == "neighbor":
+        cfg.train.neighbor_fraction = 0.5
+        cfg.train.neighbor_group_size = 4
+        cfg.loss.listwise_weight = 5.0
     elif method == "pca":
         cfg.teachers[0].pca_dim = 4
         cfg.teachers[0].pca_fit_samples = 60
@@ -191,7 +196,8 @@ def test_training_runs_with_each_target_method(experiment, tmp_path, method):
         model = StudentEncoder(TinyBackbone(), 16, {t.name: t.dim for t in cfg.teachers})
         assert [t.name for t in cfg.teachers] == ["fused"]
     run_dir = tmp_path / "run"
-    result = run_training(cfg, run_dir, model, CharTokenizer(), texts, caches, torch.device("cpu"))
+    labels = np.arange(len(texts)) % 6 if method == "neighbor" else None  # six neighbourhoods
+    result = run_training(cfg, run_dir, model, CharTokenizer(), texts, caches, torch.device("cpu"), neighbor_labels=labels)
     assert result["final_step"] == 6 and result["last_loss"] is not None and torch.isfinite(torch.tensor(result["last_loss"]))
     records = read_metrics(run_dir / "metrics.jsonl")
     assert all(torch.isfinite(torch.tensor(r["train/total"])) for r in records if "train/total" in r)

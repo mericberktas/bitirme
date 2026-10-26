@@ -122,3 +122,50 @@ def epoch_batches(train_idx: np.ndarray, batch_size: int, seed: int, epoch: int,
     perm = np.random.default_rng(seed + epoch).permutation(train_idx)
     steps = len(perm) // batch_size
     return [perm[i * batch_size : (i + 1) * batch_size].tolist() for i in range(start_batch, steps)]
+
+
+def neighbor_epoch_batches(
+    train_idx: np.ndarray,
+    labels: np.ndarray,
+    batch_size: int,
+    seed: int,
+    epoch: int,
+    fraction: float,
+    group_size: int,
+    start_batch: int = 0,
+) -> list[list[int]]:
+    """Batches for one epoch in which about `fraction` of every batch is made of neighbour groups.
+
+    `labels[i]` is the cluster (neighbourhood) of corpus text i. The training texts of every cluster are shuffled and
+    cut into groups of `group_size`; each batch takes `round(fraction * batch_size / group_size)` such groups (all
+    members of a group come from one cluster, so the texts have real neighbours in the batch) and is filled up with
+    texts drawn at random from what is left (cluster remainders and unused groups). Every text appears at most once
+    per epoch, the last partial batch is dropped, and the result is deterministic in (seed, epoch), as `epoch_batches`.
+    """
+    rng = np.random.default_rng(seed + epoch)
+    groups_per_batch = min(int(round(fraction * batch_size / group_size)), batch_size // group_size)
+    steps = len(train_idx) // batch_size
+    by_cluster: dict[int, list[int]] = {}
+    for i in rng.permutation(train_idx).tolist():
+        by_cluster.setdefault(int(labels[i]), []).append(i)
+    chunks: list[list[int]] = []
+    singles: list[int] = []
+    for members in by_cluster.values():
+        full = len(members) // group_size * group_size
+        chunks.extend(members[k : k + group_size] for k in range(0, full, group_size))
+        singles.extend(members[full:])
+    order = rng.permutation(len(chunks)).tolist()
+    chunks = [chunks[k] for k in order]
+    used = min(len(chunks), steps * groups_per_batch)
+    for chunk in chunks[used:]:  # more groups than the batches can take: their texts go to the random pool
+        singles.extend(chunk)
+    pool = rng.permutation(np.asarray(singles, dtype=np.int64)).tolist() if singles else []
+    batches: list[list[int]] = []
+    pool_at = 0
+    for b in range(steps):
+        batch = [i for chunk in chunks[b * groups_per_batch : min((b + 1) * groups_per_batch, used)] for i in chunk]
+        need = batch_size - len(batch)
+        batch.extend(pool[pool_at : pool_at + need])
+        pool_at += need
+        batches.append(batch)
+    return batches[start_batch:]
