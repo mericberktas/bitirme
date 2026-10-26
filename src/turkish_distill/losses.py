@@ -108,6 +108,37 @@ def relative_similarity_loss(
     )
 
 
+_MASKED = -1e4  # logit of the diagonal (a text is not its own neighbour); exp() of it is exactly 0 in float32
+
+
+def teacher_row_probs(teacher: torch.Tensor, temperature: float, ref_std: float) -> torch.Tensor:
+    """Each text's distribution over the other texts of the batch under one teacher (rows sum to 1, diagonal 0).
+
+    The teacher's in-batch cosines are z-scored over the off-diagonal entries and given the reference spread
+    `ref_std` before the softmax with `temperature`: a teacher with a wide spread (8K-embed: std 0.087) and one with a
+    narrow spread (BGE-M3: 0.071) then ask for the same sharpness, and the softmax itself ignores the offset.
+    """
+    t = F.normalize(teacher.float(), dim=-1)
+    sims = t @ t.T
+    n = sims.shape[0]
+    off = ~torch.eye(n, dtype=torch.bool, device=sims.device)
+    values = sims[off]
+    z = (sims - values.mean()) / (values.std(unbiased=False) + 1e-6)
+    return torch.softmax((z * ref_std / temperature).masked_fill(~off, _MASKED), dim=-1)
+
+
+def listwise_kl_loss(student: torch.Tensor, target_probs: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Mean over the rows of KL(target || student): every text's neighbour distribution under the student (softmax of
+    its raw in-batch cosines / temperature) must cover the target's. With a mixture of the teachers' row distributions
+    as the target both teachers' neighbours stay plausible, instead of being averaged into a list neither has."""
+    s = F.normalize(student.float(), dim=-1)
+    n = s.shape[0]
+    off = ~torch.eye(n, dtype=torch.bool, device=s.device)
+    log_p = torch.log_softmax((s @ s.T / temperature).masked_fill(~off, _MASKED), dim=-1)
+    q = target_probs
+    return (q * (torch.log(q.clamp_min(1e-12)) - log_p)).sum(dim=-1).mean()
+
+
 def gor_loss(emb: torch.Tensor) -> torch.Tensor:
     """Spread-out regulariser: mean squared off-diagonal cosine (second moment only)."""
     x = F.normalize(emb.float(), dim=-1)
@@ -164,11 +195,15 @@ class MultiTeacherLoss(nn.Module):
             raise ValueError(f"sum of teacher weights is not positive at step {self._step}")
         shared = cfg.relation_mode == "shared"
         shared_gram = None  # (c): the weighted average of the teachers' z-scored Gram vectors
+        mixture = None  # listwise term: the weighted mixture of the teachers' row distributions
         for name, weight in weights.items():
             logs[f"weight/{name}"] = weight
             if weight == 0.0:
                 continue  # also leaves that teacher's head without gradient (no weight decay either)
             target = targets[name].to(pooled.device)
+            if cfg.listwise_weight:
+                probs = (weight / weight_sum) * teacher_row_probs(target, cfg.listwise_temperature, cfg.gram_target_std)
+                mixture = probs if mixture is None else mixture + probs
             parts = pooled.new_zeros((), dtype=torch.float32)
             if cfg.cosine_weight:
                 c = cosine_loss(projections[name], target)
@@ -209,6 +244,10 @@ class MultiTeacherLoss(nn.Module):
                 )
                 total = total + cfg.resim_weight * r
                 logs["resim/shared"] = float(r.detach())
+        if cfg.listwise_weight and mixture is not None:
+            lw = listwise_kl_loss(pooled, mixture, cfg.listwise_temperature)
+            total = total + cfg.listwise_weight * lw
+            logs["listwise"] = float(lw.detach())
         if cfg.gor_weight:
             g = gor_loss(pooled)
             total = total + cfg.gor_weight * g

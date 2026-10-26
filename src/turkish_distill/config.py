@@ -115,6 +115,15 @@ class LossConfig:
     # feeds the similarity and ranking terms once (re-scaled to the reference mean/std above, the student stays in
     # raw cosine units); the vector term stays per teacher. Shared always standardises.
     relation_mode: str = "per_teacher"
+    # Listwise term (any relation_mode, 0 = off): for every text of the batch, the softmax (temperature
+    # `listwise_temperature`) of its cosines to the other texts is its neighbour distribution; the student's must cover
+    # the MIXTURE of the teachers' distributions (teacher weights as mixture weights; each teacher's cosines are
+    # z-scored and given `gram_target_std` as spread first), KL(mixture || student), mean over the rows. It looks at
+    # the nearest neighbours (retrieval) instead of all 16K pairs equally, and a mixture keeps both teachers'
+    # neighbours instead of averaging them into a list neither has. The softmax ignores the offset, so keep
+    # sim_weight (it pins the student's geometry, see gram_standardize).
+    listwise_weight: float = 0.0
+    listwise_temperature: float = 0.05
 
 
 @dataclass
@@ -293,6 +302,8 @@ def validate(cfg: ExperimentConfig) -> None:
         raise ValueError("train.chunk_size must be >= 1 or null")
     if cfg.loss.gram_target_std <= 0:
         raise ValueError("loss.gram_target_std must be positive")
+    if cfg.loss.listwise_weight < 0 or cfg.loss.listwise_temperature <= 0:
+        raise ValueError("loss.listwise_weight must be >= 0 and loss.listwise_temperature positive")
     if cfg.loss.relation_mode not in ("per_teacher", "shared"):
         raise ValueError(f"loss.relation_mode must be 'per_teacher' or 'shared', got {cfg.loss.relation_mode!r}")
     fusion = cfg.fusion
