@@ -44,6 +44,13 @@ class TeacherConfig:
     # re-normalise before they are used as targets (all loss terms). It opens up a teacher whose vectors sit in a
     # narrow cone (mE5: mean pairwise cosine 0.82). The cache itself is not changed.
     center: bool = False
+    # Capacity-aware target: project this teacher's cached vectors onto their top `pca_dim` principal components
+    # (fitted on `pca_fit_samples` random texts) and map them back to the original space (mean + projection), so
+    # the target keeps its size, offset and cosine geometry but only holds what a `pca_dim`-dimensional student can
+    # represent. For Qwen3-Embedding-8B (4096-d, 10% of the variance beyond 768 components) the part a 768-d student
+    # can never reach is removed from the targets. The cache itself is not changed.
+    pca_dim: Optional[int] = None
+    pca_fit_samples: int = 20000
     # Query instruction for instruction-aware teachers (Qwen3-Embedding, E5-instruct models), applied ONLY to the
     # texts that are questions: those listed in the `question` field of the JSONL files in `query_sources`
     # (the prepare_pairs outputs). Other texts keep `doc_prefix`. The student still sees the raw text. With
@@ -260,6 +267,13 @@ def validate(cfg: ExperimentConfig) -> None:
             raise ValueError(f"teacher {t.name}: dim must be positive")
         if t.weight < 0:
             raise ValueError(f"teacher {t.name}: weight must be >= 0")
+        if t.pca_dim is not None:
+            if not 2 <= t.pca_dim < t.dim:
+                raise ValueError(f"teacher {t.name}: pca_dim must be in [2, dim), got {t.pca_dim} (dim {t.dim})")
+            if t.pca_fit_samples < t.pca_dim:
+                raise ValueError(f"teacher {t.name}: pca_fit_samples must be at least pca_dim")
+            if t.center:
+                raise ValueError(f"teacher {t.name}: pca_dim and center cannot be combined")
         if t.query_prefix and not t.query_sources:
             raise ValueError(f"teacher {t.name}: query_prefix needs query_sources (JSONL files with a `question` field)")
         if t.reuse_plain_from is not None and (not t.query_prefix or t.reuse_plain_from == t.name):
@@ -297,6 +311,8 @@ def validate(cfg: ExperimentConfig) -> None:
             raise ValueError("fusion uses static teacher weights: remove weight_start/ramp settings")
         if any(t.center for t in cfg.teachers):
             raise ValueError("fusion centres the teachers itself (PCA): remove teachers[].center")
+        if any(t.pca_dim is not None for t in cfg.teachers):
+            raise ValueError("fusion reduces the teachers itself (PCA): remove teachers[].pca_dim")
 
 
 def dump_config(cfg: ExperimentConfig, path: str | Path) -> None:

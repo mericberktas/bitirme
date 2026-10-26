@@ -1,6 +1,7 @@
 """Target transformations applied on top of the cached teacher vectors.
 
 * `CenteredCache` (method a): subtract the corpus mean of a teacher's vectors and re-normalise.
+* `PCACache`: keep only the top principal components of a teacher's vectors (what a student of that size can represent).
 * `fuse_teachers` (method d): reduce every teacher to a common number of PCA components, rotate them onto one
   reference teacher with an orthogonal Procrustes fit and average the aligned unit vectors into a single target.
 
@@ -44,6 +45,39 @@ class CenteredCache:
 
     def get(self, indices) -> np.ndarray:
         return _unit(self.cache.get(indices) - self.mean)
+
+
+class PCACache:
+    """A teacher cache whose vectors are replaced by their projection onto the top `n_components` principal
+    components, mapped back to the original space and re-normalised (capacity-aware target).
+
+    The PCA is fitted on a random subset of the corpus; the target keeps the teacher's dimension, mean (offset) and
+    cosine geometry, but loses the variance that a student with `n_components` free directions cannot represent.
+    """
+
+    def __init__(self, cache, n_components: int, fit_samples: int = 20000, seed: int = 0):
+        n = len(cache)
+        rng = np.random.default_rng(seed)
+        fit_idx = np.sort(rng.choice(n, size=min(fit_samples, n), replace=False))
+        x = cache.get(fit_idx).astype(np.float64)
+        self.mean = x.mean(axis=0).astype(np.float32)
+        xc = x - self.mean
+        values, vectors = np.linalg.eigh(xc.T @ xc / len(xc))  # ascending
+        order = np.argsort(values)[::-1][:n_components]
+        self.kept_variance = float(values[order].sum() / max(values.sum(), 1e-12))
+        self.basis = vectors[:, order].astype(np.float32)  # (dim, n_components)
+        self.cache = cache
+        self.n_components = n_components
+        self.dim = cache.dim
+        self.n_texts = cache.n_texts
+
+    def __len__(self) -> int:
+        return self.n_texts
+
+    def get(self, indices) -> np.ndarray:
+        x = self.cache.get(indices)
+        centred = x - self.mean
+        return _unit(self.mean + (centred @ self.basis) @ self.basis.T)
 
 
 class ArrayCache:

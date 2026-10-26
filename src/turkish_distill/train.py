@@ -26,7 +26,7 @@ from .eval.sts import evaluate_sts, load_sts_pairs, make_student_encode_fn
 from .logging_utils import MetricsLogger
 from .losses import MultiTeacherLoss
 from .models import StudentEncoder
-from .targets import ArrayCache, CenteredCache, fuse_teachers, geometry_report
+from .targets import ArrayCache, CenteredCache, PCACache, fuse_teachers, geometry_report
 from .teachers import TeacherCache, corpus_fingerprint
 from .utils import describe_device, get_device, git_sha, set_seed, write_env_info
 
@@ -284,7 +284,8 @@ def run_training(
 
 
 def apply_target_methods(cfg: ExperimentConfig, caches: dict[str, Any]) -> tuple[ExperimentConfig, dict[str, Any]]:
-    """Methods (a) and (d): centre teachers (`teachers[].center`) or fuse them into one target (`fusion`).
+    """Methods (a) and (d) and the capacity-aware target: centre teachers (`teachers[].center`), project them onto their
+    top principal components (`teachers[].pca_dim`) or fuse them into one target (`fusion`).
 
     Returns the config the training loop should use (with fusion the only teacher is the fused one) and the
     matching caches. Without either option both are returned unchanged.
@@ -305,6 +306,16 @@ def apply_target_methods(cfg: ExperimentConfig, caches: dict[str, Any]) -> tuple
             print(
                 f"centred teacher {t.name}: mean vector norm {float(np.linalg.norm(wrapped[t.name].mean)):.3f}; "
                 f"pairwise cosine mean/std {raw['mean_cosine']:.3f}/{raw['std']:.3f} -> {new['mean_cosine']:.3f}/{new['std']:.3f}",
+                flush=True,
+            )
+        if t.pca_dim is not None:
+            pca = PCACache(caches[t.name], t.pca_dim, t.pca_fit_samples, seed=cfg.train.seed)
+            wrapped[t.name] = pca
+            probe = np.arange(min(2000, len(pca)))
+            agreement = float((pca.get(probe) * caches[t.name].get(probe)).sum(axis=1).mean())
+            print(
+                f"PCA target for teacher {t.name}: top {t.pca_dim} of {t.dim} components keep {pca.kept_variance:.3f} of the "
+                f"variance; mean cosine between target and original vector {agreement:.3f}",
                 flush=True,
             )
     return cfg, wrapped

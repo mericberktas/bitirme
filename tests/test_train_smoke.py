@@ -161,7 +161,7 @@ def test_training_runs_with_only_the_vector_term_or_only_the_relation_terms(expe
 
 @pytest.mark.parametrize(
     "method",
-    ["center", "gram_standardize", "shared_relation", "fusion"],
+    ["center", "gram_standardize", "shared_relation", "fusion", "pca"],
 )
 def test_training_runs_with_each_target_method(experiment, tmp_path, method):
     """Methods a-d run through the real loop (heads, loss, diagnostics, checkpoints) and stay finite."""
@@ -179,6 +179,9 @@ def test_training_runs_with_each_target_method(experiment, tmp_path, method):
         cfg.loss.gram_standardize = True
     elif method == "shared_relation":
         cfg.loss.relation_mode = "shared"
+    elif method == "pca":
+        cfg.teachers[0].pca_dim = 4
+        cfg.teachers[0].pca_fit_samples = 60
     else:
         cfg.fusion = FusionConfig(mode="aligned_mean", reference=cfg.teachers[0].name, dim=8, fit_samples=60)
     cfg, caches = apply_target_methods(cfg, caches)

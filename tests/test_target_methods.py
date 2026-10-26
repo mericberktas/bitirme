@@ -57,6 +57,66 @@ def test_apply_target_methods_only_touches_flagged_teachers():
     assert cfg2 is cfg and isinstance(out["a"], CenteredCache) and out["b"] is caches["b"]
 
 
+# ---- capacity-aware PCA target ---------------------------------------------------------------------------------
+
+def low_rank_vectors(n=500, d=24, rank=6, noise=0.05, offset=2.0, seed=0):
+    """Vectors that live (almost) in a `rank`-dimensional subspace around a common offset direction."""
+    rng = np.random.default_rng(seed)
+    basis = np.linalg.qr(rng.normal(size=(d, rank)))[0]
+    common = rng.normal(size=d)
+    return offset * common / np.linalg.norm(common) + rng.normal(size=(n, rank)) @ basis.T + rng.normal(size=(n, d)) * noise
+
+
+def test_pca_cache_keeps_a_low_rank_target_and_removes_the_rest():
+    from turkish_distill.targets import PCACache
+
+    cache = FakeCache(low_rank_vectors())
+    idx = np.arange(500)
+    full = cache.get(idx)
+    exact = PCACache(cache, n_components=7, fit_samples=500)   # rank 6 + the offset direction: nothing is lost
+    cos_exact = (exact.get(idx) * full).sum(axis=1).mean()
+    assert cos_exact > 0.995 and exact.kept_variance > 0.99   # what is left is the noise and float16 rounding
+    tight = PCACache(cache, n_components=2, fit_samples=500)   # fewer components than the signal has
+    cos_tight = (tight.get(idx) * full).sum(axis=1).mean()
+    assert 0.5 < cos_tight < cos_exact and tight.kept_variance < exact.kept_variance
+    out = tight.get(idx)
+    assert out.shape == full.shape and out.dtype == np.float32
+    assert np.allclose(np.linalg.norm(out, axis=1), 1.0, atol=1e-5)
+    assert tight.dim == cache.dim and len(tight) == len(cache)
+    # the part of a vector outside the kept subspace is gone: projecting the target again changes (almost) nothing
+    # (not exactly: the target is re-normalised, which moves the mean the second fit centres on)
+    again = PCACache(ArrayCache(out), n_components=2, fit_samples=500)
+    assert (again.get(idx) * out).sum(axis=1).mean() > 0.99
+
+
+def test_pca_cache_is_deterministic_for_a_seed():
+    from turkish_distill.targets import PCACache
+
+    cache = FakeCache(low_rank_vectors(seed=3))
+    a, b = PCACache(cache, 3, fit_samples=200, seed=1), PCACache(cache, 3, fit_samples=200, seed=1)
+    np.testing.assert_allclose(a.get(np.arange(50)), b.get(np.arange(50)), atol=1e-6)
+
+
+def test_pca_dim_is_applied_to_the_flagged_teacher_and_validated():
+    from turkish_distill.targets import PCACache
+
+    cfg = ExperimentConfig(
+        name="x", output_dir="o",
+        teachers=[TeacherConfig(name="a", hf_id="a", dim=24, pca_dim=4, pca_fit_samples=300), TeacherConfig(name="b", hf_id="b", dim=24)],
+    )
+    validate(cfg)
+    caches = {"a": FakeCache(low_rank_vectors(seed=1)), "b": FakeCache(low_rank_vectors(seed=2))}
+    cfg2, out = apply_target_methods(cfg, caches)
+    assert cfg2 is cfg and isinstance(out["a"], PCACache) and out["b"] is caches["b"]
+    for bad in (dict(pca_dim=24), dict(pca_dim=1), dict(pca_dim=4, pca_fit_samples=3), dict(pca_dim=4, center=True)):
+        broken = dataclasses.replace(cfg, teachers=[TeacherConfig(name="a", hf_id="a", dim=24, **bad)])
+        with pytest.raises(ValueError):
+            validate(broken)
+    fused = dataclasses.replace(cfg, fusion=FusionConfig(mode="aligned_mean", reference="a", dim=4, fit_samples=50))
+    with pytest.raises(ValueError):
+        validate(fused)
+
+
 # ---- (b) Gram standardisation ---------------------------------------------------------------------------------
 
 def test_gram_standardisation_gives_the_teacher_the_reference_geometry_and_keeps_the_student_raw():
