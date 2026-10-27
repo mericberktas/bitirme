@@ -20,6 +20,16 @@ def pool(hidden: torch.Tensor, mask: torch.Tensor, mode: str = "mean") -> torch.
     return (hidden * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
 
 
+def make_head(kind: str, hidden_size: int, dim: int, hidden: int = 0) -> nn.Module:
+    """One projection head: a single linear map, or Linear - GELU - Linear with `hidden` units (0 = hidden_size)."""
+    if kind == "linear":
+        return nn.Linear(hidden_size, dim)
+    if kind == "mlp":
+        width = hidden or hidden_size
+        return nn.Sequential(nn.Linear(hidden_size, width), nn.GELU(), nn.Linear(width, dim))
+    raise ValueError(f"unknown head {kind!r}")
+
+
 class StudentEncoder(nn.Module):
     """`backbone(input_ids=..., attention_mask=...)` must expose `.last_hidden_state`."""
 
@@ -29,12 +39,16 @@ class StudentEncoder(nn.Module):
         hidden_size: int,
         teacher_dims: dict[str, int],
         pooling: str = "mean",
+        head: str = "linear",
+        head_hidden: int = 0,
     ):
         super().__init__()
         self.backbone = backbone
         self.hidden_size = hidden_size
         self.pooling = pooling
-        self.heads = nn.ModuleDict({name: nn.Linear(hidden_size, dim) for name, dim in teacher_dims.items()})
+        self.heads = nn.ModuleDict(
+            {name: make_head(head, hidden_size, dim, head_hidden) for name, dim in teacher_dims.items()}
+        )
 
     @classmethod
     def from_pretrained(cls, student: StudentConfig, teachers: list[TeacherConfig]) -> "StudentEncoder":
@@ -42,7 +56,9 @@ class StudentEncoder(nn.Module):
 
         backbone = AutoModel.from_pretrained(student.hf_id, revision=student.revision)
         hidden = backbone.config.hidden_size
-        return cls(backbone, hidden, {t.name: t.dim for t in teachers}, student.pooling)
+        return cls(
+            backbone, hidden, {t.name: t.dim for t in teachers}, student.pooling, student.head, student.head_hidden
+        )
 
     def encode(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         out = self.backbone(input_ids=input_ids, attention_mask=attention_mask)

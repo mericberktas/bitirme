@@ -92,6 +92,8 @@ class StudentConfig:
     max_length: int = 512
     pooling: str = "mean"
     revision: Optional[str] = None  # HF commit hash of the student backbone/tokenizer
+    head: str = "linear"  # per-teacher projection head: "linear" or "mlp" (Linear - GELU - Linear)
+    head_hidden: int = 0  # width of the MLP's hidden layer; 0 = the backbone's hidden size
 
 
 @dataclass
@@ -294,6 +296,10 @@ def load_config(path: str | Path, overrides: Optional[list[str]] = None) -> Expe
 
 
 def validate(cfg: ExperimentConfig) -> None:
+    if cfg.student.head not in ("linear", "mlp"):
+        raise ValueError(f"student.head must be 'linear' or 'mlp', got {cfg.student.head!r}")
+    if cfg.student.head_hidden < 0:
+        raise ValueError("student.head_hidden must be >= 0 (0 = the backbone's hidden size)")
     names = [t.name for t in cfg.teachers]
     if len(set(names)) != len(names):
         raise ValueError(f"teacher names must be unique, got {names}")
