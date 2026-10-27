@@ -477,12 +477,15 @@ def run_evaluation(
         st_model.default_prompt_name = None
         tasks = benchmark if len(tasks_to_run) == len(TASK_CATEGORIES) else mteb.get_tasks(tasks=tasks_to_run, languages=["tur"])
         try:
-            MTEB(tasks=tasks).run(
-                st_model,
-                output_folder=str(label_dir),
-                encode_kwargs={"batch_size": batch_size},
-                overwrite_results=overwrite,
-                verbosity=verbosity,
+            run_with_write_retries(
+                lambda: MTEB(tasks=tasks).run(
+                    st_model,
+                    output_folder=str(label_dir),
+                    encode_kwargs={"batch_size": batch_size},
+                    overwrite_results=overwrite,
+                    verbosity=verbosity,
+                ),
+                label_dir,
             )
         finally:
             del st_model
@@ -494,6 +497,31 @@ def run_evaluation(
     summary["protocol"] = info
     (label_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     return label_dir
+
+
+def run_with_write_retries(run_once, label_dir: Path, attempts: int = 4, wait: float = 15.0, sleep=time.sleep):
+    """Run `run_once()`; if a result file cannot be written under `label_dir`, recreate its folder and run it again.
+
+    On a Colab Drive mount a folder that exists on Drive is sometimes not visible to the runtime for a while, and
+    mteb then fails with FileNotFoundError when it writes a task result (the finished tasks keep their files, and
+    mteb skips them on the next call, so a retry only redoes the task whose result was lost). Any other error, and a
+    path outside `label_dir`, is raised at once.
+    """
+    label_dir = Path(label_dir).resolve()
+    for attempt in range(1, attempts + 1):
+        try:
+            return run_once()
+        except OSError as exc:
+            target = Path(exc.filename).resolve() if getattr(exc, "filename", None) else None
+            if target is None or label_dir not in target.parents or attempt == attempts:
+                raise
+            print(
+                f"[{label_dir.name}] writing {target.name} failed ({type(exc).__name__}); "
+                f"recreating its folder and retrying ({attempt}/{attempts - 1}) in {wait * attempt:.0f} s",
+                flush=True,
+            )
+            sleep(wait * attempt)
+            target.parent.mkdir(parents=True, exist_ok=True)
 
 
 # --------------------------------------------------------------------------- #

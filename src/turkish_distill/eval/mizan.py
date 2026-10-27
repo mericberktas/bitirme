@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from .trmteb import _fmt, _mean, check_label_protocol, collect_task_scores, pending_tasks, sanitize_label
+from .trmteb import _fmt, _mean, check_label_protocol, collect_task_scores, pending_tasks, run_with_write_retries, sanitize_label
 
 MIZAN_MTEB_VERSION = "1.38.51"
 MTEB_INSTALL = 'pip install --ignore-requires-python "mteb==1.38.51" "datasets<4"'
@@ -267,9 +267,12 @@ def run_evaluation(
         st_model.default_prompt_name = None
         tasks = mteb.get_tasks(tasks=todo, languages=["tur"])
         try:
-            MTEB(tasks=tasks).run(
-                st_model, output_folder=str(label_dir), encode_kwargs={"batch_size": batch_size},
-                overwrite_results=overwrite, verbosity=verbosity,
+            run_with_write_retries(
+                lambda: MTEB(tasks=tasks).run(
+                    st_model, output_folder=str(label_dir), encode_kwargs={"batch_size": batch_size},
+                    overwrite_results=overwrite, verbosity=verbosity,
+                ),
+                label_dir,
             )
         finally:
             del st_model

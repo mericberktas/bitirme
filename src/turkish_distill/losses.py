@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .config import LossConfig, TeacherConfig, teacher_weight
+from .config import LossConfig, TeacherConfig, teacher_loss_scale, teacher_weight
 
 
 def cosine_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -159,6 +159,7 @@ class MultiTeacherLoss(nn.Module):
         super().__init__()
         self.cfg = loss_cfg
         self.teachers = list(teachers)
+        self._by_name = {t.name: t for t in self.teachers}
         self._step = 0
         if sum(self.current_weights().values()) <= 0:
             raise ValueError("sum of teacher weights must be positive")
@@ -196,30 +197,34 @@ class MultiTeacherLoss(nn.Module):
         shared = cfg.relation_mode == "shared"
         shared_gram = None  # (c): the weighted average of the teachers' z-scored Gram vectors
         mixture = None  # listwise term: the weighted mixture of the teachers' row distributions
+        mixture_weight = 0.0
         for name, weight in weights.items():
             logs[f"weight/{name}"] = weight
             if weight == 0.0:
                 continue  # also leaves that teacher's head without gradient (no weight decay either)
             target = targets[name].to(pooled.device)
-            if cfg.listwise_weight:
-                probs = (weight / weight_sum) * teacher_row_probs(target, cfg.listwise_temperature, cfg.gram_target_std)
+            scale = {k: teacher_loss_scale(self._by_name[name], k) for k in ("cosine", "sim", "resim", "listwise")}
+            if cfg.listwise_weight and scale["listwise"] > 0:
+                share = weight * scale["listwise"]
+                probs = share * teacher_row_probs(target, cfg.listwise_temperature, cfg.gram_target_std)
                 mixture = probs if mixture is None else mixture + probs
+                mixture_weight += share
             parts = pooled.new_zeros((), dtype=torch.float32)
-            if cfg.cosine_weight:
+            if cfg.cosine_weight and scale["cosine"] > 0:
                 c = cosine_loss(projections[name], target)
-                parts = parts + cfg.cosine_weight * c
+                parts = parts + cfg.cosine_weight * scale["cosine"] * c
                 logs[f"cos/{name}"] = float(c.detach())
             if shared:
                 z = zscore(offdiag_similarities(target))
                 shared_gram = (weight / weight_sum) * z if shared_gram is None else shared_gram + (weight / weight_sum) * z
             else:
-                if cfg.sim_weight:
+                if cfg.sim_weight and scale["sim"] > 0:
                     s = similarity_loss(
                         pooled, target, cfg.gram_standardize, cfg.gram_target_mean, cfg.gram_target_std
                     )
-                    parts = parts + cfg.sim_weight * s
+                    parts = parts + cfg.sim_weight * scale["sim"] * s
                     logs[f"sim/{name}"] = float(s.detach())
-                if cfg.resim_weight:
+                if cfg.resim_weight and scale["resim"] > 0:
                     r = relative_similarity_loss(
                         pooled,
                         target,
@@ -227,7 +232,7 @@ class MultiTeacherLoss(nn.Module):
                         cfg.resim_num_samples,
                         self._generator(pooled.device),
                     )
-                    parts = parts + cfg.resim_weight * r
+                    parts = parts + cfg.resim_weight * scale["resim"] * r
                     logs[f"resim/{name}"] = float(r.detach())
             total = total + (weight / weight_sum) * parts
         if shared and shared_gram is not None:
@@ -245,7 +250,7 @@ class MultiTeacherLoss(nn.Module):
                 total = total + cfg.resim_weight * r
                 logs["resim/shared"] = float(r.detach())
         if cfg.listwise_weight and mixture is not None:
-            lw = listwise_kl_loss(pooled, mixture, cfg.listwise_temperature)
+            lw = listwise_kl_loss(pooled, mixture / mixture_weight, cfg.listwise_temperature)
             total = total + cfg.listwise_weight * lw
             logs["listwise"] = float(lw.detach())
         if cfg.gor_weight:

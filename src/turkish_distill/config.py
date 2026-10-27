@@ -51,6 +51,12 @@ class TeacherConfig:
     # can never reach is removed from the targets. The cache itself is not changed.
     pca_dim: Optional[int] = None
     pca_fit_samples: int = 20000
+    # Per-teacher multipliers of the loss terms: keys `cosine`, `sim` (Gram MSE), `resim` (ranking hinge) and `listwise`
+    # (the teacher's share of the mixture target); missing keys are 1.0, 0 switches that teacher off for that term.
+    # They multiply the global `loss.*_weight` and the teacher `weight`. Example: BGE-M3 without the ranking term:
+    # `--override teachers.0.loss_weights.resim=0`. Not supported with relation_mode "shared" for sim/resim (one
+    # shared target for all teachers).
+    loss_weights: dict = field(default_factory=dict)
     # Query instruction for instruction-aware teachers (Qwen3-Embedding, E5-instruct models), applied ONLY to the
     # texts that are questions: those listed in the `question` field of the JSONL files in `query_sources`
     # (the prepare_pairs outputs). Other texts keep `doc_prefix`. The student still sees the raw text. With
@@ -60,6 +66,14 @@ class TeacherConfig:
     query_prefix: str = ""
     query_sources: list[str] = field(default_factory=list)
     reuse_plain_from: Optional[str] = None
+
+
+LOSS_TERMS = {"cosine", "sim", "resim", "listwise"}
+
+
+def teacher_loss_scale(teacher: TeacherConfig, term: str) -> float:
+    """The teacher's multiplier of one loss term (`loss_weights`, 1.0 when not set)."""
+    return float(teacher.loss_weights.get(term, 1.0))
 
 
 def teacher_weight(teacher: TeacherConfig, step: int) -> float:
@@ -288,6 +302,12 @@ def validate(cfg: ExperimentConfig) -> None:
             raise ValueError(f"teacher {t.name}: dim must be positive")
         if t.weight < 0:
             raise ValueError(f"teacher {t.name}: weight must be >= 0")
+        if not isinstance(t.loss_weights, dict) or set(t.loss_weights) - LOSS_TERMS:
+            raise ValueError(f"teacher {t.name}: loss_weights must be a mapping with keys from {sorted(LOSS_TERMS)}")
+        if any(v < 0 for v in t.loss_weights.values()):
+            raise ValueError(f"teacher {t.name}: loss_weights values must be >= 0")
+        if cfg.loss.relation_mode == "shared" and any(t.loss_weights.get(k, 1.0) != 1.0 for k in ("sim", "resim")):
+            raise ValueError(f"teacher {t.name}: loss_weights sim/resim are not supported with relation_mode 'shared'")
         if t.pca_dim is not None:
             if not 2 <= t.pca_dim < t.dim:
                 raise ValueError(f"teacher {t.name}: pca_dim must be in [2, dim), got {t.pca_dim} (dim {t.dim})")

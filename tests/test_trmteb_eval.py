@@ -366,3 +366,52 @@ def test_normalize_adds_a_normalize_layer_once_and_is_part_of_the_protocol(tmp_p
 def test_scale_sensitive_tasks_are_the_classification_and_clustering_tasks():
     assert len(trmteb.SCALE_SENSITIVE_TASKS) == 10
     assert {TASK_CATEGORIES[t] for t in trmteb.SCALE_SENSITIVE_TASKS} == {"Classification", "Clustering"}
+
+
+# ---- Drive write retries -------------------------------------------------------------------------------------
+
+def test_a_lost_result_folder_is_recreated_and_the_run_is_repeated(tmp_path):
+    label_dir = tmp_path / "label"
+    label_dir.mkdir()
+    missing = label_dir / "no_model_name_available" / "no_revision_available" / "Task.json"
+    calls, naps = [], []
+
+    def run_once():
+        calls.append(1)
+        if len(calls) < 3:
+            raise FileNotFoundError(2, "No such file or directory", str(missing))
+        return "finished"
+
+    assert trmteb.run_with_write_retries(run_once, label_dir, attempts=4, wait=1.0, sleep=naps.append) == "finished"
+    assert len(calls) == 3 and missing.parent.is_dir()
+    assert naps == [1.0, 2.0]   # the wait grows with the attempt
+
+
+def test_other_errors_and_paths_outside_the_label_folder_are_raised_at_once(tmp_path):
+    label_dir = tmp_path / "label"
+    label_dir.mkdir()
+    calls = []
+
+    def outside():
+        calls.append(1)
+        raise FileNotFoundError(2, "No such file or directory", str(tmp_path / "elsewhere" / "x.json"))
+
+    with pytest.raises(FileNotFoundError):
+        trmteb.run_with_write_retries(outside, label_dir, sleep=lambda s: None)
+    with pytest.raises(ValueError):
+        trmteb.run_with_write_retries(lambda: (_ for _ in ()).throw(ValueError("not an I/O error")), label_dir, sleep=lambda s: None)
+    assert len(calls) == 1
+
+
+def test_the_retries_are_limited(tmp_path):
+    label_dir = tmp_path / "label"
+    label_dir.mkdir()
+    calls = []
+
+    def always():
+        calls.append(1)
+        raise FileNotFoundError(2, "No such file or directory", str(label_dir / "a" / "b.json"))
+
+    with pytest.raises(FileNotFoundError):
+        trmteb.run_with_write_retries(always, label_dir, attempts=3, sleep=lambda s: None)
+    assert len(calls) == 3
