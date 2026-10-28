@@ -186,6 +186,12 @@ class TrainConfig:
     neighbor_group_size: int = 8
     neighbor_clusters: int = 0
     neighbor_iters: int = 10
+    # Gradient-conflict probe (0 = off): every this many steps the gradients of every (teacher, loss term) pair are
+    # measured on the batch about to be trained on (norms, cosines between terms) and logged as gradprobe/... (see
+    # grad_conflict.py). `grad_probe_params` is 'all' encoder parameters or 'last:N' top layers (less memory: one
+    # gradient copy per term).
+    grad_probe_every: int = 0
+    grad_probe_params: str = "all"
 
 
 @dataclass
@@ -347,6 +353,10 @@ def validate(cfg: ExperimentConfig) -> None:
         raise ValueError(
             "neighbour batches need 2 <= neighbor_group_size <= batch_size, neighbor_clusters 0 (auto) or >= 2, neighbor_iters >= 1"
         )
+    if tr.grad_probe_every < 0:
+        raise ValueError("train.grad_probe_every must be >= 0")
+    if tr.grad_probe_params != "all" and not re.fullmatch(r"last:[1-9]\d*", tr.grad_probe_params):
+        raise ValueError(f"train.grad_probe_params must be 'all' or 'last:N', got {tr.grad_probe_params!r}")
     if cfg.loss.gram_target_std <= 0:
         raise ValueError("loss.gram_target_std must be positive")
     if cfg.loss.listwise_weight < 0 or cfg.loss.listwise_temperature <= 0:

@@ -22,6 +22,7 @@ from .config import ExperimentConfig, TeacherConfig, dump_config, load_config, t
 from .contrastive import _capture_rng, _restore_rng, evaluate_retrieval, load_pairs
 from .data import Collator, ListDataset, epoch_batches, load_corpus, neighbor_epoch_batches
 from .diagnostics import effective_rank, geometry_agreement, mean_pairwise_cosine, teacher_cosine
+from .grad_conflict import probe_gradients
 from .eval.sts import evaluate_sts, load_sts_pairs, make_student_encode_fn
 from .logging_utils import MetricsLogger
 from .losses import MultiTeacherLoss
@@ -248,6 +249,14 @@ def run_training(
             targets = {k: v.to(device) for k, v in batch["targets"].items()}
             optimizer.zero_grad(set_to_none=True)
             criterion.set_step(step)  # `step` steps are done, this is step number `step` (teacher weights may ramp)
+            if t.grad_probe_every and step % t.grad_probe_every == 0:
+                # measurement only: autograd.grad leaves .grad alone and the RNG state is restored
+                probe = probe_gradients(
+                    model, cfg.loss, cfg.teachers, input_ids, attention_mask, targets, t.chunk_size, use_amp,
+                    step=step, seed=t.seed, params=t.grad_probe_params,
+                )
+                if probe:
+                    logger.log(step, probe, prefix="gradprobe/")
             logs = distill_step(model, criterion, input_ids, attention_mask, targets, t.chunk_size, use_amp)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), t.grad_clip)
             optimizer.step()
