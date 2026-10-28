@@ -12,8 +12,10 @@ from turkish_distill.eval.trmteb import (
     format_table,
     sanitize_label,
     summarize_dir,
+    merge_label_dirs,
     summarize_scores,
     task_score_from_result,
+    tasks_of_categories,
 )
 
 
@@ -415,3 +417,29 @@ def test_the_retries_are_limited(tmp_path):
     with pytest.raises(FileNotFoundError):
         trmteb.run_with_write_retries(always, label_dir, attempts=3, sleep=lambda s: None)
     assert len(calls) == 3
+
+
+def test_tasks_of_categories_follow_the_registry():
+    assert tasks_of_categories("STS", "BitextMining") == ["WMT16BitextMining", "STSbTR"]
+    assert len(tasks_of_categories("Retrieval")) == 11
+    with pytest.raises(ValueError):
+        tasks_of_categories("Nope")
+
+
+def test_merge_label_dirs_combines_adapter_runs(tmp_path):
+    parts = {"a_retr": ("Retrieval",), "a_cls": ("Classification",), "a_rest": ("Clustering", "PairClassification", "STS", "BitextMining")}
+    for label, categories in parts.items():
+        for task in tasks_of_categories(*categories):
+            write_result(tmp_path / label / "no_model_name_available" / "no_revision_available", task, 0.5)
+    target = merge_label_dirs(tmp_path, "a", list(parts))
+    summary = summarize_dir(target)
+    assert summary["num_tasks"] == 26 and summary["complete"]
+    with pytest.raises(FileExistsError):
+        merge_label_dirs(tmp_path, "a", list(parts))
+
+
+def test_merge_label_dirs_refuses_a_task_present_twice(tmp_path):
+    write_result(tmp_path / "x", "STSbTR", 0.5)
+    write_result(tmp_path / "y", "STSbTR", 0.6)
+    with pytest.raises(ValueError, match="STSbTR"):
+        merge_label_dirs(tmp_path, "z", ["x", "y"])

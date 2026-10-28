@@ -277,6 +277,37 @@ def run_evaluation_isolated(label: str, output_dir: str | Path, **kwargs) -> Pat
     return Path(output_dir) / label
 
 
+def tasks_of_categories(*categories: str) -> list[str]:
+    """TR-MTEB task names of the given official categories, in TASK_CATEGORIES order."""
+    unknown = sorted(set(categories) - set(CATEGORY_ORDER))
+    if unknown:
+        raise ValueError(f"unknown categories {unknown}; choose from {CATEGORY_ORDER}")
+    return [task for task, category in TASK_CATEGORIES.items() if category in categories]
+
+
+def merge_label_dirs(output_dir: str | Path, label: str, parts: list[str]) -> Path:
+    """Combine the task results of several label folders into one new label (e.g. one run per task-specific adapter).
+
+    Models with a separate adapter per task type (jina-embeddings-v5) are evaluated once per adapter on that adapter's
+    tasks only; this copies those results into `output_dir/label` so `summarize_dir` sees the 26 tasks together.
+    A task present in two parts is an error (it would silently pick one), and an existing target is refused.
+    """
+    output_dir = Path(output_dir)
+    target = output_dir / label
+    if target.exists() and any(target.iterdir()):
+        raise FileExistsError(f"{target} already has content; pick another label or remove it")
+    target.mkdir(parents=True, exist_ok=True)
+    origin: dict[str, str] = {}
+    for part in parts:
+        for name, info in collect_task_scores(output_dir / part).items():
+            if name in origin:
+                raise ValueError(f"task {name} appears in both {origin[name]!r} and {part!r}")
+            origin[name] = part
+            shutil.copy2(info["file"], target / f"{name}.json")
+    (target / "MERGED.json").write_text(json.dumps({"parts": parts, "task_origin": origin}, indent=2), encoding="utf-8")
+    return target
+
+
 def prepare_reuse(
     output_dir: str | Path,
     label_dir: str | Path,
