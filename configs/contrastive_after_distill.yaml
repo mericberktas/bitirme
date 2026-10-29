@@ -1,0 +1,48 @@
+# Contrastive fine-tuning on top of the distilled student: the main-line model (1k base, BGE-M3 + instructed 8K-embed,
+# 10,800 steps, lr 1e-4; TR-MTEB 67.71) is the starting point, trained on the (question, passage) pairs of the three QA
+# datasets with in-batch-negative InfoNCE. The student sees plain text (no instruction), as in every other run.
+#
+# The risk is forgetting what distillation gave (STS, bitext, classification), so the learning rate is a tenth of the
+# distillation rate and the run is short (38.7K pairs / batch 128 = ~300 steps per epoch). Untuned starting values,
+# not results. The notebook (notebooks/contrastive_finetune.ipynb) sets name, student.hf_id and the learning rate and
+# afterwards blends each result with the distilled model (soup).
+
+name: contrastive_after_distill
+output_dir: /content/drive/MyDrive/bitirme/runs
+local_tmp_dir: /content/ckpt_staging
+tensorboard: true
+
+student:
+  # Local path of the distilled model's final/ folder (HF format); the notebook overrides it. No revision for a local path.
+  hf_id: /content/drive/MyDrive/bitirme/runs/scale_two_instr8k_s10800_lr1e4/20261027-152516-b2b0c4b/final
+  revision: null
+  max_length: 512
+  pooling: mean
+
+data:
+  pairs_train: /content/drive/MyDrive/bitirme/data/stage1/pairs_train.jsonl
+  pairs_val: /content/drive/MyDrive/bitirme/data/stage1/pairs_val.jsonl
+  max_train_pairs: null
+  query_max_length: 64
+  passage_max_length: 512
+
+loss:
+  name: mnrl
+  scale: 20.0
+
+train:
+  batch_size: 128
+  chunk_size: 32
+  lr: 1.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  epochs: 1
+  max_steps: null
+  grad_clip: 1.0
+  bf16: true
+  seed: 42
+  num_workers: 2
+  log_every: 20
+  eval_every: 50
+  ckpt_every: 100
+  keep_last: 2
