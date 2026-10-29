@@ -90,6 +90,30 @@ def patch_transformers_for_mteb(module=None) -> bool:
     return True
 
 
+def patch_torchvision_for_datasets(io_module=None) -> bool:
+    """Keep `datasets` 3.x working with a torchvision that no longer has `torchvision.io.VideoReader`.
+
+    While `datasets` converts a column to numpy (`with_format("numpy")`, which `train_test_split(stratify_by_column=...)`
+    does) its formatter runs `from torchvision.io import VideoReader` whenever torchvision has been imported. Newer
+    torchvision builds removed that class, so the very first stratified subsampling fails with `ImportError: cannot
+    import name 'VideoReader'` (seen on Colab in the Mizan run: TurkishMovieSentimentClassification). The formatter only
+    uses the name for an `isinstance` check, so a placeholder class is enough. Returns True when the placeholder was
+    added (False when torchvision is not installed or already has the class)."""
+    if io_module is None:
+        import importlib.util
+
+        if importlib.util.find_spec("torchvision") is None:
+            return False
+        try:
+            import torchvision.io as io_module
+        except Exception:
+            return False
+    if hasattr(io_module, "VideoReader"):
+        return False
+    io_module.VideoReader = type("VideoReader", (), {})
+    return True
+
+
 def allow_long_http_headers(session_cls=None, limit: int = 65536) -> bool:
     """Raise aiohttp's default limit on response header size (8190 bytes) for every new `ClientSession`.
 
@@ -222,6 +246,7 @@ def run_evaluation(
         raise ValueError(f"dtype must be one of {dtypes}, got {dtype!r}")
     patch_transformers_for_mteb()
     allow_long_http_headers()
+    patch_torchvision_for_datasets()
     try:
         import mteb
         from mteb import MTEB

@@ -74,3 +74,14 @@ def test_http_sessions_get_a_larger_header_limit_once():
     Session(max_field_size=99)  # an explicit value of the caller wins
     assert created[-1]["max_field_size"] == 99 and created[-1]["max_line_size"] == 1234
     assert mizan.allow_long_http_headers(Session, limit=1234) is False  # not wrapped a second time
+
+
+def test_torchvision_placeholder_for_datasets():
+    from types import SimpleNamespace
+
+    io = SimpleNamespace()
+    assert mizan.patch_torchvision_for_datasets(io) is True
+    assert isinstance(io.VideoReader, type)  # datasets only uses it in an isinstance check
+    assert mizan.patch_torchvision_for_datasets(io) is False  # not replaced a second time
+    existing = SimpleNamespace(VideoReader=int)
+    assert mizan.patch_torchvision_for_datasets(existing) is False and existing.VideoReader is int
