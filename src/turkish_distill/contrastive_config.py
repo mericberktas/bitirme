@@ -35,6 +35,12 @@ class ContrastiveLossConfig:
     # mnrl_symmetric: the average of that and passage -> question.
     name: str = "mnrl"
     scale: float = 20.0  # 1 / temperature; the lab's 0.02 corresponds to 50
+    # Anchor (distillation regulariser): keep the pooled embeddings of the batch texts close to those of a frozen copy
+    # of the model the run starts from (cosine to the anchor, and MSE between the two cosine-similarity matrices over
+    # the questions and passages together; the same two terms as the distillation loss, so 10 / 200 are the usual
+    # weights). 0 = off. Meant for fine-tuning an already distilled student without forgetting what distillation gave.
+    anchor_cosine_weight: float = 0.0
+    anchor_gram_weight: float = 0.0
 
 
 @dataclass
@@ -105,6 +111,8 @@ def validate(cfg: ContrastiveConfig) -> None:
         raise ValueError(f"loss.name must be one of {LOSS_NAMES}, got {cfg.loss.name!r}")
     if cfg.loss.scale <= 0:
         raise ValueError("loss.scale must be positive")
+    if cfg.loss.anchor_cosine_weight < 0 or cfg.loss.anchor_gram_weight < 0:
+        raise ValueError("loss.anchor_cosine_weight and loss.anchor_gram_weight must be >= 0")
     if t.batch_size < 2:
         raise ValueError("train.batch_size must be >= 2 (in-batch negatives need other pairs)")
     if t.chunk_size is not None and t.chunk_size < 1:

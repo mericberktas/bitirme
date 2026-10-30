@@ -29,6 +29,11 @@ data:
 loss:
   name: mnrl
   scale: 20.0
+  # Anchor (distillation regulariser): pull the batch embeddings toward a frozen copy of the starting model (cosine +
+  # similarity-matrix MSE, the distillation loss' own terms). 0 = off, which was the first round (67.11 at lr 1e-5);
+  # the notebook turns it on with 10 / 200 for the next round.
+  anchor_cosine_weight: 0.0
+  anchor_gram_weight: 0.0
 
 train:
   batch_size: 128

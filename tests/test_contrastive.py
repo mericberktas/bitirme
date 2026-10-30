@@ -97,6 +97,93 @@ def test_cached_step_reproduces_dropout_masks_through_the_rng_restore():
         torch.testing.assert_close(a, b)
 
 
+# --- anchor (distillation regulariser) -------------------------------------- #
+
+ANCHOR = ContrastiveLossConfig(name="mnrl", scale=20.0, anchor_cosine_weight=10.0, anchor_gram_weight=200.0)
+
+
+def test_anchor_is_a_frozen_independent_copy():
+    model = tiny_model(0)
+    anchor = ct.make_anchor(model)
+    assert not any(p.requires_grad for p in anchor.parameters()) and not anchor.training
+    before = [p.clone() for p in anchor.parameters()]
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(1.0)
+    for a, b in zip(anchor.parameters(), before):
+        torch.testing.assert_close(a, b)
+
+
+def test_anchor_term_is_zero_and_changes_nothing_while_the_model_equals_its_anchor():
+    batch = make_batch(8)
+    plain, anchored = tiny_model(2), tiny_model(2)
+    ct.contrastive_step(plain, batch, ct.make_loss(ANCHOR), chunk_size=None)
+    logs = ct.contrastive_step(anchored, batch, ct.make_loss(ANCHOR), chunk_size=None,
+                               anchor_model=ct.make_anchor(anchored), anchor_fn=ct.make_anchor_loss(ANCHOR))
+    assert logs["anchor_cos"] == pytest.approx(1.0, abs=1e-5) and logs["anchor_gram"] == pytest.approx(0.0, abs=1e-8)
+    assert logs["loss"] == pytest.approx(logs["nce_loss"], rel=1e-6)
+    for (name, a), (_, b) in zip(plain.named_parameters(), anchored.named_parameters()):
+        torch.testing.assert_close(b.grad, a.grad, rtol=1e-4, atol=1e-6, msg=name)
+
+
+@pytest.mark.parametrize("chunk", [3, 5])
+def test_cached_anchored_step_matches_the_plain_anchored_step(chunk):
+    batch = make_batch(10)
+    reference = tiny_model(4)
+    plain, cached = copy.deepcopy(tiny_model(7)), copy.deepcopy(tiny_model(7))  # drifted away from the anchor
+    anchor = ct.make_anchor(reference)
+    fn = ct.make_anchor_loss(ANCHOR)
+    a = ct.contrastive_step(plain, batch, ct.make_loss(ANCHOR), chunk_size=None, anchor_model=anchor, anchor_fn=fn)
+    b = ct.contrastive_step(cached, batch, ct.make_loss(ANCHOR), chunk_size=chunk, anchor_model=anchor, anchor_fn=fn)
+    assert a["anchor_gram"] > 0
+    for key in ("loss", "nce_loss", "anchor_loss", "anchor_cos"):
+        assert b[key] == pytest.approx(a[key], rel=1e-4)
+    for (name, x), (_, y) in zip(plain.named_parameters(), cached.named_parameters()):
+        torch.testing.assert_close(y.grad, x.grad, rtol=1e-4, atol=1e-6, msg=name)
+
+
+def test_anchor_term_keeps_the_embeddings_closer_to_the_anchor_during_training():
+    batch = make_batch(12)
+
+    def drift(weighted: bool) -> float:
+        model = tiny_model(0)
+        anchor = ct.make_anchor(model)
+        cfg = ANCHOR if weighted else ContrastiveLossConfig(name="mnrl", scale=20.0)
+        fn = ct.make_anchor_loss(ANCHOR)  # always measured, only added to the loss when `weighted`
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.5)
+        last = {}
+        for _ in range(15):
+            optimizer.zero_grad()
+            last = ct.contrastive_step(model, batch, ct.make_loss(cfg), chunk_size=4,
+                                       anchor_model=anchor if weighted else None, anchor_fn=fn if weighted else None)
+            optimizer.step()
+        with torch.no_grad():
+            q = model.encode(batch["q_input_ids"], batch["q_attention_mask"])
+            p = model.encode(batch["p_input_ids"], batch["p_attention_mask"])
+            aq = anchor.encode(batch["q_input_ids"], batch["q_attention_mask"])
+            ap = anchor.encode(batch["p_input_ids"], batch["p_attention_mask"])
+            return float(fn(q, p, aq, ap)[1]["anchor_cos"])
+
+    assert drift(True) > drift(False)
+
+
+def test_anchor_weights_must_not_be_negative(tmp_path):
+    path = write_cfg(tmp_path)
+    assert load_contrastive_config(path).loss.anchor_cosine_weight == 0.0  # off by default
+    with pytest.raises(ValueError):
+        load_contrastive_config(path, ["loss.anchor_gram_weight=-1"])
+
+
+def test_smoke_training_with_the_anchor_logs_it_and_still_learns(tmp_path):
+    cfg = smoke_cfg(tmp_path)
+    cfg.loss.anchor_cosine_weight, cfg.loss.anchor_gram_weight = 10.0, 200.0
+    run_dir = tmp_path / "anchored"
+    run_contrastive(cfg, run_dir, tiny_model(), CharTokenizer(), make_pairs(64), make_pairs(24, 100), torch.device("cpu"))
+    train = [r for r in read_metrics(run_dir / "metrics.jsonl") if "train/loss" in r]
+    assert all("train/anchor_cos" in r and "train/nce_loss" in r for r in train)
+    assert train[0]["train/anchor_cos"] <= 1.0 + 1e-6 and train[-1]["train/nce_loss"] < train[0]["train/nce_loss"]
+
+
 # --- batching --------------------------------------------------------------- #
 
 def test_batches_never_repeat_a_passage_and_are_deterministic():

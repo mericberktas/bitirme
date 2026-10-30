@@ -11,6 +11,7 @@ assumption:
 
 from __future__ import annotations
 
+import copy
 import json
 from contextlib import contextmanager
 from pathlib import Path
@@ -51,6 +52,28 @@ def make_loss(cfg: ContrastiveLossConfig) -> LossFn:
     return lambda q, p: info_nce(q, p, cfg.scale, symmetric)
 
 
+def make_anchor_loss(cfg: ContrastiveLossConfig) -> Callable[..., tuple[torch.Tensor, dict[str, torch.Tensor]]]:
+    """Distillation toward a frozen reference model, on the pooled embeddings of the batch's questions and passages."""
+
+    def fn(q: torch.Tensor, p: torch.Tensor, aq: torch.Tensor, ap: torch.Tensor):
+        s = F.normalize(torch.cat([q, p]).float(), dim=-1)
+        a = F.normalize(torch.cat([aq, ap]).float(), dim=-1)
+        cosine = (s * a).sum(-1)
+        gram = F.mse_loss(s @ s.T, a @ a.T)
+        loss = cfg.anchor_cosine_weight * (1 - cosine).mean() + cfg.anchor_gram_weight * gram
+        return loss, {"anchor_cos": cosine.mean().detach(), "anchor_gram": gram.detach(), "anchor_loss": loss.detach()}
+
+    return fn
+
+
+def make_anchor(model) -> torch.nn.Module:
+    """Frozen copy of `model` (eval mode, no gradients): the reference the anchor loss pulls toward."""
+    anchor = copy.deepcopy(model).eval()
+    for parameter in anchor.parameters():
+        parameter.requires_grad_(False)
+    return anchor
+
+
 # --------------------------------------------------------------------------- #
 # Training step (plain or gradient-cached)
 # --------------------------------------------------------------------------- #
@@ -81,8 +104,13 @@ def contrastive_step(
     loss_fn: LossFn,
     chunk_size: Optional[int] = None,
     use_amp: bool = False,
+    anchor_model=None,
+    anchor_fn=None,
 ) -> dict[str, float]:
     """One forward/backward pass; gradients are left on the parameters (the caller runs the optimiser).
+
+    With `anchor_model` and `anchor_fn` (see `make_anchor`, `make_anchor_loss`) the loss also contains the anchor
+    term; the anchor embeddings are computed without gradients, so the cached and plain steps still agree.
 
     With `chunk_size`, the embeddings of the whole batch are computed without gradients first, the loss and
     its gradient w.r.t. the embeddings are computed on the full batch, and then each mini-batch is encoded
@@ -92,8 +120,21 @@ def contrastive_step(
     q_ids, q_mask = batch["q_input_ids"], batch["q_attention_mask"]
     p_ids, p_mask = batch["p_input_ids"], batch["p_attention_mask"]
     size = q_ids.size(0)
+    anchored = anchor_model is not None and anchor_fn is not None
+
+    def total_loss(q, p, aq=None, ap=None):
+        loss, logs = loss_fn(q, p)
+        if not anchored:
+            return loss, logs
+        anchor_term, anchor_logs = anchor_fn(q, p, aq, ap)
+        return loss + anchor_term, {**logs, **anchor_logs, "nce_loss": loss.detach()}
+
     if chunk_size is None or chunk_size >= size:
-        loss, logs = loss_fn(_encode(model, q_ids, q_mask, use_amp), _encode(model, p_ids, p_mask, use_amp))
+        aq = ap = None
+        if anchored:
+            with torch.no_grad():
+                aq, ap = _encode(anchor_model, q_ids, q_mask, use_amp), _encode(anchor_model, p_ids, p_mask, use_amp)
+        loss, logs = total_loss(_encode(model, q_ids, q_mask, use_amp), _encode(model, p_ids, p_mask, use_amp), aq, ap)
         loss.backward()
         return {"loss": float(loss.detach()), **{k: float(v) for k, v in logs.items()}}
 
@@ -108,7 +149,11 @@ def contrastive_step(
                 states[side].append(_capture_rng(device))
                 parts.append(_encode(model, ids[sl], mask[sl], use_amp))
             embeddings[side] = torch.cat(parts).requires_grad_(True)
-    loss, logs = loss_fn(embeddings["q"], embeddings["p"])
+        anchors = {}
+        if anchored:
+            for side, ids, mask in (("q", q_ids, q_mask), ("p", p_ids, p_mask)):
+                anchors[side] = torch.cat([_encode(anchor_model, ids[sl], mask[sl], use_amp) for sl in slices])
+    loss, logs = total_loss(embeddings["q"], embeddings["p"], anchors.get("q"), anchors.get("p"))
     loss.backward()  # fills .grad of the two embedding tensors only
 
     for side, ids, mask in (("q", q_ids, q_mask), ("p", p_ids, p_mask)):

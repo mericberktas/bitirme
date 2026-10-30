@@ -25,6 +25,8 @@ from .contrastive import (
     contrastive_step,
     evaluate_retrieval,
     load_pairs,
+    make_anchor,
+    make_anchor_loss,
     make_loss,
     unique_passage_batches,
 )
@@ -68,6 +70,10 @@ def run_contrastive(
 
     model.to(device)
     loss_fn = make_loss(cfg.loss)
+    anchor_model = anchor_fn = None
+    if cfg.loss.anchor_cosine_weight > 0 or cfg.loss.anchor_gram_weight > 0:
+        anchor_model = make_anchor(model)  # taken BEFORE a checkpoint is loaded: the starting model, not a resumed one
+        anchor_fn = make_anchor_loss(cfg.loss)
     optimizer = torch.optim.AdamW(model.parameters(), lr=t.lr, weight_decay=t.weight_decay)
     scheduler = build_scheduler(optimizer, total_steps, t.warmup_ratio)
 
@@ -127,7 +133,7 @@ def run_contrastive(
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
             optimizer.zero_grad(set_to_none=True)
-            logs = contrastive_step(model, batch, loss_fn, t.chunk_size, use_amp)
+            logs = contrastive_step(model, batch, loss_fn, t.chunk_size, use_amp, anchor_model, anchor_fn)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), t.grad_clip)
             optimizer.step()
             scheduler.step()
