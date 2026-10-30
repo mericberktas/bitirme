@@ -31,16 +31,25 @@ LossFn = Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, dict[str, to
 # --------------------------------------------------------------------------- #
 
 def info_nce(
-    q: torch.Tensor, p: torch.Tensor, scale: float, symmetric: bool = False
+    q: torch.Tensor, p: torch.Tensor, scale: float, symmetric: bool = False, neg_mask: Optional[torch.Tensor] = None
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Cross-entropy over cosine similarities; the i-th passage is the positive of the i-th question."""
+    """Cross-entropy over cosine similarities; the i-th passage is the positive of the i-th question.
+
+    `p` may hold more rows than `q`: the first len(q) are the positives, the rest are extra (hard) negatives that
+    only act as negatives for every question. `neg_mask` (len(q) x extra, True = ignore) removes the entries where
+    an extra passage is, in fact, the positive of that question. The symmetric direction (passage -> question)
+    covers the positives only.
+    """
     q = F.normalize(q.float(), dim=-1)
     p = F.normalize(p.float(), dim=-1)
     scores = q @ p.T * scale
-    labels = torch.arange(scores.size(0), device=scores.device)
+    n = q.size(0)
+    if neg_mask is not None:
+        scores = torch.cat([scores[:, :n], scores[:, n:].masked_fill(neg_mask, float("-inf"))], dim=1)
+    labels = torch.arange(n, device=scores.device)
     loss = F.cross_entropy(scores, labels)
     if symmetric:
-        loss = (loss + F.cross_entropy(scores.T, labels)) / 2
+        loss = (loss + F.cross_entropy(scores[:, :n].T, labels)) / 2
     accuracy = (scores.argmax(dim=1) == labels).float().mean()
     return loss, {"acc": accuracy.detach()}
 
@@ -49,7 +58,7 @@ def make_loss(cfg: ContrastiveLossConfig) -> LossFn:
     symmetric = cfg.name == "mnrl_symmetric"
     if cfg.name not in ("mnrl", "mnrl_symmetric"):
         raise ValueError(f"unknown contrastive loss {cfg.name!r}")
-    return lambda q, p: info_nce(q, p, cfg.scale, symmetric)
+    return lambda q, p, neg_mask=None: info_nce(q, p, cfg.scale, symmetric, neg_mask)
 
 
 def make_anchor_loss(cfg: ContrastiveLossConfig) -> Callable[..., tuple[torch.Tensor, dict[str, torch.Tensor]]]:
@@ -119,11 +128,12 @@ def contrastive_step(
     """
     q_ids, q_mask = batch["q_input_ids"], batch["q_attention_mask"]
     p_ids, p_mask = batch["p_input_ids"], batch["p_attention_mask"]
-    size = q_ids.size(0)
+    size = max(q_ids.size(0), p_ids.size(0))  # p holds the positives and, if mined, the hard negatives
     anchored = anchor_model is not None and anchor_fn is not None
+    neg_mask = batch.get("neg_mask")
 
     def total_loss(q, p, aq=None, ap=None):
-        loss, logs = loss_fn(q, p)
+        loss, logs = loss_fn(q, p) if neg_mask is None else loss_fn(q, p, neg_mask)
         if not anchored:
             return loss, logs
         anchor_term, anchor_logs = anchor_fn(q, p, aq, ap)
@@ -139,26 +149,31 @@ def contrastive_step(
         return {"loss": float(loss.detach()), **{k: float(v) for k, v in logs.items()}}
 
     device = q_ids.device
-    slices = [slice(i, i + chunk_size) for i in range(0, size, chunk_size)]
+    slices_of = {
+        side: [slice(i, i + chunk_size) for i in range(0, ids.size(0), chunk_size)]
+        for side, ids in (("q", q_ids), ("p", p_ids))
+    }
     embeddings: dict[str, torch.Tensor] = {}
     states: dict[str, list] = {}
     with torch.no_grad():
         for side, ids, mask in (("q", q_ids, q_mask), ("p", p_ids, p_mask)):
             states[side], parts = [], []
-            for sl in slices:
+            for sl in slices_of[side]:
                 states[side].append(_capture_rng(device))
                 parts.append(_encode(model, ids[sl], mask[sl], use_amp))
             embeddings[side] = torch.cat(parts).requires_grad_(True)
         anchors = {}
         if anchored:
             for side, ids, mask in (("q", q_ids, q_mask), ("p", p_ids, p_mask)):
-                anchors[side] = torch.cat([_encode(anchor_model, ids[sl], mask[sl], use_amp) for sl in slices])
+                anchors[side] = torch.cat(
+                    [_encode(anchor_model, ids[sl], mask[sl], use_amp) for sl in slices_of[side]]
+                )
     loss, logs = total_loss(embeddings["q"], embeddings["p"], anchors.get("q"), anchors.get("p"))
     loss.backward()  # fills .grad of the two embedding tensors only
 
     for side, ids, mask in (("q", q_ids, q_mask), ("p", p_ids, p_mask)):
         grad = embeddings[side].grad
-        for sl, state in zip(slices, states[side]):
+        for sl, state in zip(slices_of[side], states[side]):
             with _restore_rng(state, device):
                 chunk = _encode(model, ids[sl], mask[sl], use_amp)
             (chunk * grad[sl]).sum().backward()
@@ -169,9 +184,14 @@ def contrastive_step(
 # Data: pairs, batching without duplicate passages, collation
 # --------------------------------------------------------------------------- #
 
-def load_pairs(path: str | Path, max_pairs: Optional[int] = None, seed: int = 42) -> dict[str, list[str]]:
-    """Read a pairs JSONL written by `prepare_pairs` into parallel lists."""
-    questions, passages, ids = [], [], []
+def load_pairs(path: str | Path, max_pairs: Optional[int] = None, seed: int = 42) -> dict[str, Any]:
+    """Read a pairs JSONL written by `prepare_pairs` (or `mine_negatives`) into parallel lists.
+
+    If the rows carry `neg_passage_ids`, the result also has `neg_ids` (one list per pair) and `pool`, a
+    passage-id -> text map over all rows (also those dropped by `max_pairs`), which the negatives refer to.
+    """
+    questions, passages, ids, negs = [], [], [], []
+    pool: dict[str, str] = {}
     with open(path, encoding="utf-8") as f:
         for line in f:
             if line.strip():
@@ -179,10 +199,17 @@ def load_pairs(path: str | Path, max_pairs: Optional[int] = None, seed: int = 42
                 questions.append(row["question"])
                 passages.append(row["passage"])
                 ids.append(row["passage_id"])
+                pool[row["passage_id"]] = row["passage"]
+                negs.append(row.get("neg_passage_ids"))
+    mined = any(n is not None for n in negs)
     if max_pairs is not None and len(questions) > max_pairs:
         keep = np.sort(np.random.default_rng(seed).choice(len(questions), size=max_pairs, replace=False))
-        questions, passages, ids = ([x[i] for i in keep] for x in (questions, passages, ids))
-    return {"question": questions, "passage": passages, "passage_id": ids}
+        questions, passages, ids, negs = ([x[i] for i in keep] for x in (questions, passages, ids, negs))
+    out: dict[str, Any] = {"question": questions, "passage": passages, "passage_id": ids}
+    if mined:
+        out["neg_ids"] = [n or [] for n in negs]
+        out["pool"] = pool
+    return out
 
 
 def unique_passage_batches(
@@ -213,23 +240,53 @@ def unique_passage_batches(
 
 
 class PairCollator:
-    """Tokenises a list of pair indices into question and passage tensors (different max lengths)."""
+    """Tokenises a list of pair indices into question and passage tensors (different max lengths).
 
-    def __init__(self, tokenizer: Any, pairs: dict[str, list[str]], query_max_length: int, passage_max_length: int):
+    With `hard_negatives` > 0 the passage tensors hold the batch's positives first and then `hard_negatives`
+    mined negatives per pair (pair-major); `neg_mask` marks the (question, negative) cells where the negative is
+    that question's own positive passage. A pair without a mined negative gets a deterministic random pool
+    passage instead (an easy negative, never its own positive).
+    """
+
+    def __init__(
+        self, tokenizer: Any, pairs: dict[str, Any], query_max_length: int, passage_max_length: int,
+        hard_negatives: int = 0,
+    ):
+        if hard_negatives > 0 and "neg_ids" not in pairs:
+            raise ValueError("data.hard_negatives > 0 needs a pairs file with `neg_passage_ids` (see mine_negatives)")
         self.tokenizer = tokenizer
         self.pairs = pairs
         self.query_max_length = query_max_length
         self.passage_max_length = passage_max_length
+        self.hard_negatives = hard_negatives
+        self._pool_ids = sorted(pairs["pool"]) if hard_negatives > 0 else []
+
+    def _negative_ids(self, index: int) -> list[str]:
+        own = self.pairs["passage_id"][index]
+        mined = [n for n in self.pairs["neg_ids"][index] if n != own][: self.hard_negatives]
+        rng = np.random.default_rng(index)
+        while len(mined) < self.hard_negatives:  # fill with easy negatives so every batch has the same shape
+            candidate = self._pool_ids[int(rng.integers(len(self._pool_ids)))]
+            if candidate != own and candidate not in mined:
+                mined.append(candidate)
+        return mined
 
     def __call__(self, indices: list[int]) -> dict[str, torch.Tensor]:
         def tok(texts: list[str], max_length: int):
             return self.tokenizer(texts, max_length=max_length, padding=True, truncation=True, return_tensors="pt")
 
         q = tok([self.pairs["question"][i] for i in indices], self.query_max_length)
-        p = tok([self.pairs["passage"][i] for i in indices], self.passage_max_length)
+        passages = [self.pairs["passage"][i] for i in indices]
+        extra: dict[str, torch.Tensor] = {}
+        if self.hard_negatives > 0:
+            neg_ids = [n for i in indices for n in self._negative_ids(i)]
+            passages = passages + [self.pairs["pool"][n] for n in neg_ids]
+            own = [self.pairs["passage_id"][i] for i in indices]
+            extra["neg_mask"] = torch.tensor([[n == o for n in neg_ids] for o in own], dtype=torch.bool)
+        p = tok(passages, self.passage_max_length)
         return {
             "q_input_ids": q["input_ids"], "q_attention_mask": q["attention_mask"],
-            "p_input_ids": p["input_ids"], "p_attention_mask": p["attention_mask"],
+            "p_input_ids": p["input_ids"], "p_attention_mask": p["attention_mask"], **extra,
         }
 
 

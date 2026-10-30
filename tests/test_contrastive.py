@@ -184,6 +184,110 @@ def test_smoke_training_with_the_anchor_logs_it_and_still_learns(tmp_path):
     assert train[0]["train/anchor_cos"] <= 1.0 + 1e-6 and train[-1]["train/nce_loss"] < train[0]["train/nce_loss"]
 
 
+# --- hard negatives --------------------------------------------------------- #
+
+def test_info_nce_with_extra_negatives_matches_a_hand_computed_case():
+    q = torch.eye(2)
+    p = torch.cat([torch.eye(2), torch.tensor([[1.0, 0.0]])])  # third row: an extra negative equal to question 0
+    s = 2.0
+    loss, logs = ct.info_nce(q, p, scale=s, neg_mask=torch.tensor([[False], [False]]))
+    e = np.exp
+    expected = (-np.log(e(s) / (e(s) + 1 + e(s))) - np.log(e(s) / (1 + e(s) + 1))) / 2
+    assert loss.item() == pytest.approx(expected, rel=1e-5)
+    # masking the cell (question 0, extra 0): the extra passage IS question 0's positive and must be ignored
+    masked, _ = ct.info_nce(q, p, scale=s, neg_mask=torch.tensor([[True], [False]]))
+    expected_masked = (-np.log(e(s) / (e(s) + 1)) - np.log(e(s) / (1 + e(s) + 1))) / 2
+    assert masked.item() == pytest.approx(expected_masked, rel=1e-5)
+
+
+def hn_pairs(n=12, negs=2):
+    pairs = make_pairs(n)
+    pool = {i: t for i, t in zip(pairs["passage_id"], pairs["passage"])}
+    ids = pairs["passage_id"]
+    pairs["neg_ids"] = [[ids[(i + 1 + j) % n] for j in range(negs)] for i in range(n)]
+    pairs["pool"] = pool
+    return pairs
+
+
+def test_collator_appends_the_negatives_and_masks_cells_where_a_negative_is_the_questions_own_positive():
+    pairs = hn_pairs(6, negs=1)
+    pairs["neg_ids"][1] = [pairs["passage_id"][0]]  # pair 1's negative is pair 0's positive
+    col = ct.PairCollator(CharTokenizer(), pairs, 32, 64, hard_negatives=1)
+    batch = col([0, 1, 2])
+    assert batch["p_input_ids"].shape[0] == 6 and batch["q_input_ids"].shape[0] == 3
+    mask = batch["neg_mask"]
+    # pair 0's negative is pair 1's positive (cell [1, 0]) and pair 1's negative is pair 0's positive (cell [0, 1])
+    assert mask.shape == (3, 3) and bool(mask[1, 0]) and bool(mask[0, 1]) and int(mask.sum()) == 2
+
+
+def test_collator_fills_missing_negatives_without_using_the_own_positive_and_rejects_unmined_files():
+    pairs = hn_pairs(8, negs=1)
+    pairs["neg_ids"][3] = []
+    col = ct.PairCollator(CharTokenizer(), pairs, 32, 64, hard_negatives=2)
+    filled = col._negative_ids(3)
+    assert len(filled) == 2 and len(set(filled)) == 2 and pairs["passage_id"][3] not in filled
+    batch = col([2, 3])
+    assert batch["p_input_ids"].shape[0] == 2 + 4
+    assert col([2, 3])["p_input_ids"].equal(batch["p_input_ids"])  # deterministic fill
+    with pytest.raises(ValueError):
+        ct.PairCollator(CharTokenizer(), make_pairs(4), 32, 64, hard_negatives=1)
+
+
+@pytest.mark.parametrize("chunk", [3, 5])
+def test_cached_step_with_hard_negatives_and_anchor_matches_the_plain_step(chunk):
+    pairs = hn_pairs(10, negs=1)
+    batch = ct.PairCollator(CharTokenizer(), pairs, 32, 64, hard_negatives=1)(list(range(10)))
+    anchor = ct.make_anchor(tiny_model(9))
+    fn = ct.make_anchor_loss(ANCHOR)
+    plain, cached = tiny_model(5), tiny_model(5)
+    a = ct.contrastive_step(plain, batch, ct.make_loss(ANCHOR), None, anchor_model=anchor, anchor_fn=fn)
+    b = ct.contrastive_step(cached, batch, ct.make_loss(ANCHOR), chunk, anchor_model=anchor, anchor_fn=fn)
+    assert b["loss"] == pytest.approx(a["loss"], rel=1e-4)
+    for (name, x), (_, y) in zip(plain.named_parameters(), cached.named_parameters()):
+        torch.testing.assert_close(y.grad, x.grad, rtol=1e-4, atol=1e-6, msg=name)
+
+
+def test_load_pairs_reads_mined_negatives_and_keeps_the_pool_when_subsampling(tmp_path):
+    pairs = hn_pairs(10, negs=2)
+    path = tmp_path / "hn.jsonl"
+    with open(path, "w", encoding="utf-8") as f:
+        for i in range(10):
+            f.write(json.dumps({"question": pairs["question"][i], "passage": pairs["passage"][i],
+                                "passage_id": pairs["passage_id"][i], "neg_passage_ids": pairs["neg_ids"][i]}) + "\n")
+    full = ct.load_pairs(path)
+    assert full["neg_ids"] == pairs["neg_ids"] and set(full["pool"]) == set(pairs["passage_id"])
+    sub = ct.load_pairs(path, max_pairs=4, seed=1)
+    assert len(sub["question"]) == 4 and len(sub["neg_ids"]) == 4 and len(sub["pool"]) == 10
+    assert "neg_ids" not in ct.load_pairs(write_plain_pairs(tmp_path))  # a file without negatives stays plain
+
+
+def write_plain_pairs(tmp_path):
+    path = tmp_path / "plain.jsonl"
+    pairs = make_pairs(4)
+    with open(path, "w", encoding="utf-8") as f:
+        for i in range(4):
+            f.write(json.dumps({"question": pairs["question"][i], "passage": pairs["passage"][i],
+                                "passage_id": pairs["passage_id"][i]}) + "\n")
+    return path
+
+
+def test_smoke_training_with_hard_negatives_and_the_anchor(tmp_path):
+    cfg = smoke_cfg(tmp_path)
+    cfg.data.hard_negatives = 1
+    cfg.loss.anchor_cosine_weight, cfg.loss.anchor_gram_weight = 10.0, 200.0
+    run_dir = tmp_path / "hn"
+    result = run_contrastive(cfg, run_dir, tiny_model(), CharTokenizer(), hn_pairs(64, negs=2), make_pairs(24, 100),
+                             torch.device("cpu"))
+    assert result["final_step"] == 12
+    train = [r for r in read_metrics(run_dir / "metrics.jsonl") if "train/loss" in r]
+    assert train[-1]["train/nce_loss"] < train[0]["train/nce_loss"]
+
+
+def test_hard_negative_count_must_not_be_negative(tmp_path):
+    with pytest.raises(ValueError):
+        load_contrastive_config(write_cfg(tmp_path), ["data.hard_negatives=-1"])
+
+
 # --- batching --------------------------------------------------------------- #
 
 def test_batches_never_repeat_a_passage_and_are_deterministic():

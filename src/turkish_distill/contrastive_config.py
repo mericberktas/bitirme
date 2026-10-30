@@ -27,6 +27,9 @@ class ContrastiveDataConfig:
     max_train_pairs: Optional[int] = None  # seeded subset, for quick debugging runs
     query_max_length: int = 64
     passage_max_length: int = 512
+    # Hard negatives per question (0 = in-batch negatives only). Needs a pairs file written by `mine_negatives`
+    # (each row has `neg_passage_ids`); the mined passages are added to the batch's passage pool.
+    hard_negatives: int = 0
 
 
 @dataclass
@@ -111,6 +114,8 @@ def validate(cfg: ContrastiveConfig) -> None:
         raise ValueError(f"loss.name must be one of {LOSS_NAMES}, got {cfg.loss.name!r}")
     if cfg.loss.scale <= 0:
         raise ValueError("loss.scale must be positive")
+    if cfg.data.hard_negatives < 0:
+        raise ValueError("data.hard_negatives must be >= 0")
     if cfg.loss.anchor_cosine_weight < 0 or cfg.loss.anchor_gram_weight < 0:
         raise ValueError("loss.anchor_cosine_weight and loss.anchor_gram_weight must be >= 0")
     if t.batch_size < 2:

@@ -20,11 +20,16 @@ student:
   pooling: mean
 
 data:
-  pairs_train: /content/drive/MyDrive/bitirme/data/stage1/pairs_train.jsonl
+  # pairs_train_clean: pairs_train minus the 447 pairs that share 13-grams with TR-MTEB/Mizan test texts or the RAGTurk
+  # corpus (turkish-rag-eval: none); the first contrastive round (ctr_lr1e5 / ctr_lr2e5) used the unfiltered file.
+  pairs_train: /content/drive/MyDrive/bitirme/data/stage1/pairs_train_clean.jsonl
   pairs_val: /content/drive/MyDrive/bitirme/data/stage1/pairs_val.jsonl
   max_train_pairs: null
   query_max_length: 64
   passage_max_length: 512
+  # Mined hard negatives per question (0 = in-batch only); needs a pairs file written by mine_negatives
+  # (data/stage1/pairs_train_clean_hn.jsonl), set together with data.pairs_train.
+  hard_negatives: 0
 
 loss:
   name: mnrl

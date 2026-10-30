@@ -90,7 +90,9 @@ def run_contrastive(
                 warnings.warn("config differs from the one the checkpoint was created with")
             print(f"resumed from {ckpt_path.name} (step {step})", flush=True)
 
-    collator = PairCollator(tokenizer, train_pairs, cfg.data.query_max_length, cfg.data.passage_max_length)
+    collator = PairCollator(
+        tokenizer, train_pairs, cfg.data.query_max_length, cfg.data.passage_max_length, cfg.data.hard_negatives
+    )
     encode_q = make_student_encode_fn(model, tokenizer, device, cfg.data.query_max_length)
     encode_p = make_student_encode_fn(model, tokenizer, device, cfg.data.passage_max_length, batch_size=64)
 
