@@ -19,11 +19,16 @@ import torch.nn.functional as F
 from .config import LossConfig, TeacherConfig, teacher_loss_scale, teacher_weight
 
 
-def cosine_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """1 - cos(pred, target), averaged over the batch."""
+def cosine_per_sample(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """1 - cos(pred, target) of every row (shape (batch,))."""
     pred = F.normalize(pred.float(), dim=-1)
     target = F.normalize(target.float(), dim=-1)
-    return (1.0 - (pred * target).sum(dim=-1)).mean()
+    return 1.0 - (pred * target).sum(dim=-1)
+
+
+def cosine_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """1 - cos(pred, target), averaged over the batch."""
+    return cosine_per_sample(pred, target).mean()
 
 
 def offdiag_similarities(vectors: torch.Tensor) -> torch.Tensor:
@@ -52,12 +57,28 @@ def standardized_teacher_pairs(
     return ref_mean + ref_std * zscore(offdiag_similarities(teacher))
 
 
+def row_centered_mse(student_sims: torch.Tensor, teacher_sims: torch.Tensor) -> torch.Tensor:
+    """Squared error of two n x n similarity matrices after every row of their difference has lost its own mean.
+
+    Only the off-diagonal entries count (a text's similarity to itself is 1 for both). A row may be shifted by any
+    constant without changing the loss: only the pattern of which texts are closer than which is matched, not the
+    distance to all of them at once. Divided by n * n so that, for differences whose rows have mean zero, it equals
+    `F.mse_loss` of the full matrices (the diagonal adds zero there) and `sim_weight` keeps its meaning.
+    """
+    n = student_sims.shape[0]
+    off = ~torch.eye(n, dtype=torch.bool, device=student_sims.device)
+    diff = (student_sims - teacher_sims).masked_fill(~off, 0.0)
+    centred = (diff - diff.sum(dim=1, keepdim=True) / (n - 1)).masked_fill(~off, 0.0)
+    return centred.pow(2).sum() / (n * n)
+
+
 def similarity_loss(
     student: torch.Tensor,
     teacher: torch.Tensor,
     standardize: bool = False,
     ref_mean: float = 0.30,
     ref_std: float = 0.07,
+    row_centered: bool = False,
 ) -> torch.Tensor:
     """MSE between the in-batch cosine-similarity matrices of student and teacher.
 
@@ -65,10 +86,14 @@ def similarity_loss(
     the student's own cosines stay as they are. Standardising the student too (Pearson matching) leaves its offset
     and scale free, and a student that is free to stay in a narrow cone did (mE5: 52.85 against 58.46).
     """
+    if row_centered and standardize:
+        raise ValueError("row_centered and standardize cannot be combined")
     if standardize:
         return F.mse_loss(offdiag_similarities(student), standardized_teacher_pairs(teacher, ref_mean, ref_std))
     s = F.normalize(student.float(), dim=-1)
     t = F.normalize(teacher.float(), dim=-1)
+    if row_centered:
+        return row_centered_mse(s @ s.T, t @ t.T)
     return F.mse_loss(s @ s.T, t @ t.T)
 
 
@@ -148,6 +173,28 @@ def gor_loss(emb: torch.Tensor) -> torch.Tensor:
     return (sims[off] ** 2).mean()
 
 
+def sample_teacher_weights(
+    per_sample: dict[str, torch.Tensor], mode: str, temperature: float, floor: float
+) -> dict[str, torch.Tensor]:
+    """Per-text weights of the teachers' vector terms from the student's own agreement with each teacher.
+
+    `per_sample` holds every active teacher's loss for every text of the batch (shape (batch,)). Softmax over the
+    teachers of -loss / temperature (mode "easy": the teacher the student already follows) or +loss / temperature
+    ("hard"), floored at `floor`, so the weights of one text sum to one over the teachers, then multiplied by the
+    number of teachers: with equal losses every weight is 1 and a single teacher always gets exactly 1. The weights
+    carry no gradient (they only re-scale each text's term).
+    """
+    if mode not in ("easy", "hard"):
+        raise ValueError(f"mode must be 'easy' or 'hard', got {mode!r}")
+    names = list(per_sample)
+    m = len(names)
+    stack = torch.stack([per_sample[n].detach().float() for n in names])  # (teachers, batch)
+    sign = -1.0 if mode == "easy" else 1.0
+    share = torch.softmax(sign * stack / temperature, dim=0)
+    weights = (floor + (1.0 - m * floor) * share) * m
+    return {n: weights[i] for i, n in enumerate(names)}
+
+
 class MultiTeacherLoss(nn.Module):
     """Weighted sum of per-teacher losses, normalised by the sum of teacher weights.
 
@@ -186,7 +233,11 @@ class MultiTeacherLoss(nn.Module):
         pooled: torch.Tensor,
         projections: dict[str, torch.Tensor],
         targets: dict[str, torch.Tensor],
+        parts_out: Optional[dict[str, torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
+        """`parts_out` (optional, filled in place): every teacher's share of the total (its terms times weight / weight
+        sum) under its name, and the terms that belong to no single teacher (shared relation target, listwise, gor)
+        under "common"; they sum to the returned total. Used by the gradient surgery between teachers."""
         cfg = self.cfg
         total = pooled.new_zeros((), dtype=torch.float32)
         logs: dict[str, float] = {}
@@ -195,6 +246,24 @@ class MultiTeacherLoss(nn.Module):
         if weight_sum <= 0:
             raise ValueError(f"sum of teacher weights is not positive at step {self._step}")
         shared = cfg.relation_mode == "shared"
+        common = None  # terms of no single teacher, tracked for `parts_out`
+
+        def add_common(term: torch.Tensor) -> None:
+            nonlocal common
+            common = term if common is None else common + term
+
+        # vector-term losses of every text and, optionally, the per-text teacher weights computed from them
+        cos_ps: dict[str, torch.Tensor] = {}
+        for name, weight in weights.items():
+            if weight > 0 and cfg.cosine_weight and teacher_loss_scale(self._by_name[name], "cosine") > 0:
+                cos_ps[name] = cosine_per_sample(projections[name], targets[name].to(pooled.device))
+        sample_w: dict[str, torch.Tensor] = {}
+        if cfg.sample_weighting != "none" and len(cos_ps) >= 2:
+            sample_w = sample_teacher_weights(
+                cos_ps, cfg.sample_weighting, cfg.sample_weight_temperature, cfg.sample_weight_floor
+            )
+            for name, w in sample_w.items():
+                logs[f"sw/{name}"] = float(w.mean())
         shared_gram = None  # (c): the weighted average of the teachers' z-scored Gram vectors
         mixture = None  # listwise term: the weighted mixture of the teachers' row distributions
         mixture_weight = 0.0
@@ -210,9 +279,10 @@ class MultiTeacherLoss(nn.Module):
                 mixture = probs if mixture is None else mixture + probs
                 mixture_weight += share
             parts = pooled.new_zeros((), dtype=torch.float32)
-            if cfg.cosine_weight and scale["cosine"] > 0:
-                c = cosine_loss(projections[name], target)
-                parts = parts + cfg.cosine_weight * scale["cosine"] * c
+            if name in cos_ps:
+                c = cos_ps[name].mean()
+                weighted = (sample_w[name] * cos_ps[name]).mean() if name in sample_w else c
+                parts = parts + cfg.cosine_weight * scale["cosine"] * weighted
                 logs[f"cos/{name}"] = float(c.detach())
             if shared:
                 z = zscore(offdiag_similarities(target))
@@ -220,7 +290,8 @@ class MultiTeacherLoss(nn.Module):
             else:
                 if cfg.sim_weight and scale["sim"] > 0:
                     s = similarity_loss(
-                        pooled, target, cfg.gram_standardize, cfg.gram_target_mean, cfg.gram_target_std
+                        pooled, target, cfg.gram_standardize, cfg.gram_target_mean, cfg.gram_target_std,
+                        cfg.sim_row_centered,
                     )
                     parts = parts + cfg.sim_weight * scale["sim"] * s
                     logs[f"sim/{name}"] = float(s.detach())
@@ -235,6 +306,8 @@ class MultiTeacherLoss(nn.Module):
                     parts = parts + cfg.resim_weight * scale["resim"] * r
                     logs[f"resim/{name}"] = float(r.detach())
             total = total + (weight / weight_sum) * parts
+            if parts_out is not None:
+                parts_out[name] = (weight / weight_sum) * parts
         if shared and shared_gram is not None:
             student_pairs = offdiag_similarities(pooled)
             # averaging disagreeing teachers shrinks the spread: re-standardise, then give it the reference geometry
@@ -242,20 +315,26 @@ class MultiTeacherLoss(nn.Module):
             if cfg.sim_weight:
                 s = F.mse_loss(student_pairs, target_pairs)
                 total = total + cfg.sim_weight * s
+                add_common(cfg.sim_weight * s)
                 logs["sim/shared"] = float(s.detach())
             if cfg.resim_weight:
                 r = ranking_hinge(
                     student_pairs, target_pairs, cfg.resim_margin, cfg.resim_num_samples, self._generator(pooled.device)
                 )
                 total = total + cfg.resim_weight * r
+                add_common(cfg.resim_weight * r)
                 logs["resim/shared"] = float(r.detach())
         if cfg.listwise_weight and mixture is not None:
             lw = listwise_kl_loss(pooled, mixture / mixture_weight, cfg.listwise_temperature)
             total = total + cfg.listwise_weight * lw
+            add_common(cfg.listwise_weight * lw)
             logs["listwise"] = float(lw.detach())
         if cfg.gor_weight:
             g = gor_loss(pooled)
             total = total + cfg.gor_weight * g
+            add_common(cfg.gor_weight * g)
             logs["gor"] = float(g.detach())
+        if parts_out is not None and common is not None:
+            parts_out["common"] = common
         logs["total"] = float(total.detach())
         return total, logs

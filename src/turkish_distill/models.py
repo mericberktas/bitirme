@@ -56,9 +56,16 @@ class StudentEncoder(nn.Module):
 
         backbone = AutoModel.from_pretrained(student.hf_id, revision=student.revision)
         hidden = backbone.config.hidden_size
-        return cls(
+        model = cls(
             backbone, hidden, {t.name: t.dim for t in teachers}, student.pooling, student.head, student.head_hidden
         )
+        if student.heads_path:
+            model.load_heads(student.heads_path)
+        return model
+
+    def load_heads(self, path: str | Path) -> None:
+        """Start the projection heads from a saved `teacher_heads.pt` (strict: same teachers, same head type)."""
+        self.heads.load_state_dict(torch.load(str(path), map_location="cpu"))
 
     def encode(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         out = self.backbone(input_ids=input_ids, attention_mask=attention_mask)

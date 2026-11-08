@@ -23,6 +23,7 @@ from .contrastive import _capture_rng, _restore_rng, evaluate_retrieval, load_pa
 from .data import Collator, ListDataset, epoch_batches, load_corpus, neighbor_epoch_batches
 from .diagnostics import effective_rank, geometry_agreement, mean_pairwise_cosine, teacher_cosine
 from .grad_conflict import probe_gradients
+from .gradproj import pcgrad_combine
 from .eval.sts import evaluate_sts, load_sts_pairs, make_student_encode_fn
 from .logging_utils import MetricsLogger
 from .losses import MultiTeacherLoss
@@ -51,6 +52,8 @@ def distill_step(
     targets: dict[str, torch.Tensor],
     chunk_size: Optional[int] = None,
     use_amp: bool = False,
+    projection: str = "none",
+    generator: Optional[torch.Generator] = None,
 ) -> dict[str, float]:
     """One forward/backward pass of the distillation loss; gradients stay on the parameters.
 
@@ -60,6 +63,11 @@ def distill_step(
     full batch (the teacher heads get their gradients there), and each mini-batch is then encoded again with
     gradients and back-propagated with the stored embedding gradient. The result equals the plain step; the RNG
     state is restored so dropout masks are the same in both passes.
+
+    With `projection` "pcgrad" the gradient each teacher's loss gives the pooled embeddings is first made free of its
+    conflict with the other teachers' gradients (gradproj.pcgrad_combine) and the sum of those replaces `pooled.grad`;
+    the heads keep the gradients of their own teacher. That needs the pooled embeddings as a leaf, so the batch always
+    goes through the chunked path (one chunk when `chunk_size` is not set).
     """
     device = input_ids.device
 
@@ -68,14 +76,17 @@ def distill_step(
             return model.encode(ids, mask).float()
 
     size = input_ids.size(0)
-    if chunk_size is None or chunk_size >= size:
+    if projection not in ("none", "pcgrad"):
+        raise ValueError(f"projection must be 'none' or 'pcgrad', got {projection!r}")
+    if projection == "none" and (chunk_size is None or chunk_size >= size):
         pooled = encode(input_ids, attention_mask)
         projections = {name: head(pooled) for name, head in model.heads.items()}
         loss, logs = criterion(pooled, projections, targets)
         loss.backward()
         return logs
 
-    slices = [slice(i, i + chunk_size) for i in range(0, size, chunk_size)]
+    step_size = size if (chunk_size is None or chunk_size >= size) else chunk_size
+    slices = [slice(i, i + step_size) for i in range(0, size, step_size)]
     states, parts = [], []
     with torch.no_grad():
         for sl in slices:
@@ -83,8 +94,30 @@ def distill_step(
             parts.append(encode(input_ids[sl], attention_mask[sl]))
     pooled = torch.cat(parts).requires_grad_(True)
     projections = {name: head(pooled) for name, head in model.heads.items()}
-    loss, logs = criterion(pooled, projections, targets)
-    loss.backward()  # teacher heads get their gradient here; `pooled` gets .grad
+    if projection == "pcgrad":
+        shares: dict[str, torch.Tensor] = {}
+        loss, logs = criterion(pooled, projections, targets, parts_out=shares)
+        teacher_grads = []
+        for key, share in shares.items():
+            if key == "common" or not share.requires_grad:
+                continue
+            (g,) = torch.autograd.grad(share, pooled, retain_graph=True, allow_unused=True)
+            teacher_grads.append(torch.zeros_like(pooled) if g is None else g.detach())
+        combined = None
+        if len(teacher_grads) >= 2:
+            combined, info = pcgrad_combine(teacher_grads, generator)
+            logs.update({f"pcgrad/{k}": v for k, v in info.items()})
+            common = shares.get("common")
+            if common is not None and common.requires_grad:
+                (g,) = torch.autograd.grad(common, pooled, retain_graph=True, allow_unused=True)
+                if g is not None:
+                    combined = combined + g.detach()
+        loss.backward()  # teacher heads get their gradient here; `pooled` gets the plain sum, replaced below
+        if combined is not None:
+            pooled.grad = combined
+    else:
+        loss, logs = criterion(pooled, projections, targets)
+        loss.backward()  # teacher heads get their gradient here; `pooled` gets .grad
     for sl, state in zip(slices, states):
         with _restore_rng(state, device):
             chunk = encode(input_ids[sl], attention_mask[sl])
@@ -210,6 +243,7 @@ def run_training(
         log_validation(0)
 
     use_amp = bool(t.bf16 and device.type == "cuda")
+    projection_generator = torch.Generator().manual_seed(t.seed)  # visiting order of the gradient surgery (CPU, tiny)
     model.train()
     window: dict[str, float] = {}
     window_count = 0
@@ -257,7 +291,10 @@ def run_training(
                 )
                 if probe:
                     logger.log(step, probe, prefix="gradprobe/")
-            logs = distill_step(model, criterion, input_ids, attention_mask, targets, t.chunk_size, use_amp)
+            logs = distill_step(
+                model, criterion, input_ids, attention_mask, targets, t.chunk_size, use_amp,
+                projection=t.grad_projection, generator=projection_generator,
+            )
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), t.grad_clip)
             optimizer.step()
             scheduler.step()

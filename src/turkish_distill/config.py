@@ -94,6 +94,9 @@ class StudentConfig:
     revision: Optional[str] = None  # HF commit hash of the student backbone/tokenizer
     head: str = "linear"  # per-teacher projection head: "linear" or "mlp" (Linear - GELU - Linear)
     head_hidden: int = 0  # width of the MLP's hidden layer; 0 = the backbone's hidden size
+    # Optional `teacher_heads.pt` of an earlier run whose projection heads start this run (alternating.py hands the head
+    # of a teacher's arm from one round to the next). Loaded strictly: the same teachers, the same head type.
+    heads_path: Optional[str] = None
 
 
 @dataclass
@@ -140,6 +143,20 @@ class LossConfig:
     # sim_weight (it pins the student's geometry, see gram_standardize).
     listwise_weight: float = 0.0
     listwise_temperature: float = 0.05
+    # Row-centred similarity term (0.0 = the plain Gram MSE): every row of the student-minus-teacher similarity matrix
+    # loses its own mean before squaring, so a text may sit at any distance from ALL the others (an offset per row is
+    # free) and only the pattern inside the row is matched. This is the objective of score-only distillation
+    # (query-wise, offset-free); the plain term also pins the absolute geometry. Not combined with gram_standardize or
+    # relation_mode "shared".
+    sim_row_centered: bool = False
+    # Sample-wise teacher weights for the vector (cosine) term, label-free (adapted from CA-MKD / COMPACT, which weight
+    # teachers by their agreement with the label or the student): for every text a softmax over the teachers of
+    # -loss / temperature ("easy": the teacher the student already follows gets more weight) or +loss / temperature
+    # ("hard"); the weights are floored at `sample_weight_floor`, sum to one over the teachers, are multiplied by the
+    # number of teachers (so equal weights stay equal on average) and carry no gradient. "none" = the usual fixed weights.
+    sample_weighting: str = "none"
+    sample_weight_temperature: float = 0.05
+    sample_weight_floor: float = 0.2
 
 
 @dataclass
@@ -192,6 +209,11 @@ class TrainConfig:
     # gradient copy per term).
     grad_probe_every: int = 0
     grad_probe_params: str = "all"
+    # Gradient surgery between the teachers ("none" = sum of the teachers' gradients). "pcgrad": the gradient each
+    # teacher's loss gives the pooled embedding of the batch loses its component along any other teacher's gradient it
+    # conflicts with (negative inner product), as in PCGrad / Road MOPD, then the gradients are summed. Applied at the
+    # pooled embedding (what gradient caching hands to the encoder), which is where the teachers' terms meet.
+    grad_projection: str = "none"
 
 
 @dataclass
@@ -363,6 +385,16 @@ def validate(cfg: ExperimentConfig) -> None:
         raise ValueError("loss.listwise_weight must be >= 0 and loss.listwise_temperature positive")
     if cfg.loss.relation_mode not in ("per_teacher", "shared"):
         raise ValueError(f"loss.relation_mode must be 'per_teacher' or 'shared', got {cfg.loss.relation_mode!r}")
+    if cfg.loss.sim_row_centered and (cfg.loss.gram_standardize or cfg.loss.relation_mode == "shared"):
+        raise ValueError("loss.sim_row_centered cannot be combined with gram_standardize or relation_mode 'shared'")
+    if cfg.loss.sample_weighting not in ("none", "easy", "hard"):
+        raise ValueError(f"loss.sample_weighting must be 'none', 'easy' or 'hard', got {cfg.loss.sample_weighting!r}")
+    if cfg.loss.sample_weight_temperature <= 0:
+        raise ValueError("loss.sample_weight_temperature must be positive")
+    if not 0.0 <= cfg.loss.sample_weight_floor < 1.0 / max(len(cfg.teachers), 1):
+        raise ValueError("loss.sample_weight_floor must be in [0, 1 / number of teachers)")
+    if cfg.train.grad_projection not in ("none", "pcgrad"):
+        raise ValueError(f"train.grad_projection must be 'none' or 'pcgrad', got {cfg.train.grad_projection!r}")
     fusion = cfg.fusion
     if fusion.mode not in ("none", "aligned_mean"):
         raise ValueError(f"fusion.mode must be 'none' or 'aligned_mean', got {fusion.mode!r}")
