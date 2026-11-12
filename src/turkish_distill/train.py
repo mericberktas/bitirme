@@ -24,6 +24,7 @@ from .data import Collator, ListDataset, epoch_batches, load_corpus, neighbor_ep
 from .diagnostics import effective_rank, geometry_agreement, mean_pairwise_cosine, teacher_cosine
 from .grad_conflict import probe_gradients
 from .gradproj import pcgrad_combine
+from .joint import JointContrastive
 from .eval.sts import evaluate_sts, load_sts_pairs, make_student_encode_fn
 from .logging_utils import MetricsLogger
 from .losses import MultiTeacherLoss
@@ -183,6 +184,7 @@ def run_training(
     resume: bool = True,
     retrieval_val: Optional[dict[str, list[str]]] = None,
     neighbor_labels: Optional[np.ndarray] = None,
+    joint_pairs: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     run_dir = Path(run_dir)
     ckpt_dir = run_dir / "checkpoints"
@@ -243,6 +245,20 @@ def run_training(
         log_validation(0)
 
     use_amp = bool(t.bf16 and device.type == "cuda")
+    joint = None
+    if cfg.joint.pairs is not None:
+        if joint_pairs is None:
+            raise ValueError("joint.pairs is set but no pairs were passed to run_training")
+        joint = JointContrastive(cfg.joint, tokenizer, joint_pairs, t.seed, t.chunk_size, use_amp)
+        used = joint.pair_steps(t.max_steps)
+        print(
+            f"joint contrastive: {len(joint_pairs['question'])} pairs, {joint.steps_per_epoch} batches of "
+            f"{cfg.joint.batch_size} per epoch; every {cfg.joint.every} steps from step {cfg.joint.start_step}: "
+            f"{used} pair batches = {used / joint.steps_per_epoch:.1f} epochs, weight {cfg.joint.weight}",
+            flush=True,
+        )
+    joint_window: dict[str, float] = {}
+    joint_count = 0
     projection_generator = torch.Generator().manual_seed(t.seed)  # visiting order of the gradient surgery (CPU, tiny)
     model.train()
     window: dict[str, float] = {}
@@ -295,6 +311,11 @@ def run_training(
                 model, criterion, input_ids, attention_mask, targets, t.chunk_size, use_amp,
                 projection=t.grad_projection, generator=projection_generator,
             )
+            if joint is not None and joint.applies(step):
+                # adds its gradient to the distillation gradient: one objective, one optimiser step
+                for k, v in joint.step(model, step, device).items():
+                    joint_window[k] = joint_window.get(k, 0.0) + v
+                joint_count += 1
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), t.grad_clip)
             optimizer.step()
             scheduler.step()
@@ -317,6 +338,9 @@ def run_training(
                     record["gpu_mem_gb"] = torch.cuda.max_memory_allocated() / 1e9
                 logger.log(step, record, prefix="train/")
                 window, window_count, window_start = {}, 0, time.time()
+                if joint_count:
+                    logger.log(step, {k: v / joint_count for k, v in joint_window.items()}, prefix="train/ctr_")
+                    joint_window, joint_count = {}, 0
             if step % t.diag_every == 0 or step == t.max_steps:
                 log_validation(step)
             if step % t.ckpt_every == 0:
@@ -419,12 +443,13 @@ def main(argv: Optional[list[str]] = None) -> None:
             warnings.warn(f"STS monitoring disabled: {exc}")
 
     retrieval_val = load_pairs(cfg.eval.pairs_val) if cfg.eval.pairs_val else None
+    joint_pairs = load_pairs(cfg.joint.pairs) if cfg.joint.pairs else None
 
     print(f"run dir: {run_dir}", flush=True)
     print(f"device: {describe_device(get_device())}", flush=True)
     result = run_training(
         cfg, run_dir, model, tokenizer, texts, caches, get_device(), sts_data=sts_data, resume=not args.no_resume,
-        retrieval_val=retrieval_val, neighbor_labels=neighbor_labels,
+        retrieval_val=retrieval_val, neighbor_labels=neighbor_labels, joint_pairs=joint_pairs,
     )
     print(result, flush=True)
 

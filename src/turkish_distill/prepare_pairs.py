@@ -5,7 +5,9 @@
         --wikiqa-parquet data/raw/wikiqa/turkish-wiki-qa-4mil.parquet --out-dir data/stage1
 
 Writes, in --out-dir:
-    pairs_train.jsonl / pairs_val.jsonl   {id, source, question, passage, passage_id}  (contrastive training)
+    pairs_train.jsonl / pairs_val.jsonl   {id, source, question, passage, passage_id, answer}  (contrastive training;
+                                          `answer` is the dataset's answer: a span for TurHistQuAD, a generated
+                                          sentence for Wikipedia-QA and WikiRAG-TR; absent if the row has none)
     corpus_train.jsonl                    {"text": ...}, unique questions and passages of the training
                                           pairs (distillation corpus, same format as prepare_corpus.py)
     stats.json                            counts per source and what was dropped
@@ -45,11 +47,27 @@ def passage_id(passage: str) -> str:
     return hashlib.sha1(passage.encode("utf-8")).hexdigest()[:12]
 
 
-def make_pair(source: str, question: str, passage: str) -> Optional[Pair]:
+def make_pair(source: str, question: str, passage: str, answer: Optional[str] = None) -> Optional[Pair]:
     question, passage = normalize(question), normalize(passage)
     if not question or not passage:
         return None
-    return {"source": source, "question": question, "passage": passage, "passage_id": passage_id(passage)}
+    pair = {"source": source, "question": question, "passage": passage, "passage_id": passage_id(passage)}
+    answer = normalize(answer) if answer is not None else ""
+    if answer:
+        pair["answer"] = answer
+    return pair
+
+
+def answer_text(value) -> Optional[str]:
+    """The answer of a raw row: a string, a SQuAD-style {"text": str | [str, ...]} dict or a list (first entry)."""
+    if isinstance(value, dict):
+        value = value.get("text")
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    if value is None:
+        return None
+    text = normalize(value)
+    return text or None
 
 
 # --------------------------------------------------------------------------- #
@@ -68,7 +86,7 @@ def load_turhistquad(directory: str | Path, stats: dict) -> tuple[list[Pair], li
             if SQUAD_ID.fullmatch(str(row.get("id", ""))):
                 squad_dropped += 1
                 continue
-            pair = make_pair("turhistquad", row["question"], row["context"])
+            pair = make_pair("turhistquad", row["question"], row["context"], answer_text(row.get("answers")))
             if pair:
                 pairs.append(pair)
         out[split] = pairs
@@ -98,7 +116,7 @@ def load_wikirag(path: str | Path, stats: dict) -> list[Pair]:
             if idx < 0 or not passage.strip():
                 dropped["bad_index"] += 1
                 continue
-            pair = make_pair("wikirag", row["question"], passage)
+            pair = make_pair("wikirag", row["question"], passage, answer_text(row.get("answer")))
             if pair:
                 pairs.append(pair)
     stats["wikirag_dropped"] = dropped
@@ -142,15 +160,16 @@ def load_wikiqa(
             seen.add(key)
             try:
                 qas = answers if isinstance(answers, list) else ast.literal_eval(answers)
-                questions = [normalize(q["questionText"]) for q in qas if q.get("questionText")]
+                questions = [(normalize(q["questionText"]), answer_text(q.get("answerText")))
+                             for q in qas if q.get("questionText")]
             except (ValueError, SyntaxError, TypeError, AttributeError):
                 parse_failed += 1
                 continue
-            questions = [q for q in questions if len(q) >= 10]
+            questions = [qa for qa in questions if len(qa[0]) >= 10]
             if len(questions) > max_q_per_article:
-                questions = rng.sample(questions, max_q_per_article)
-            for question in questions:
-                pair = {"source": "wikiqa", "question": question, "passage": passage, "passage_id": passage_id(passage)}
+                questions = rng.sample(questions, max_q_per_article)  # same draw as over the bare questions
+            for question, answer in questions:
+                pair = make_pair("wikiqa", question, passage, answer)
                 if len(reservoir) < max_pairs:
                     reservoir.append(pair)
                 else:
@@ -174,20 +193,20 @@ def _ngram_hashes(text: str, n: int) -> set[int]:
     return {hash(tuple(words[i:i + n])) for i in range(len(words) - n + 1)}
 
 
-def decontaminate(pairs: list[Pair], forbidden: Iterable[str], n: int = 13) -> tuple[list[Pair], int]:
-    """Drop pairs whose passage or question equals / shares a word n-gram with a forbidden text.
+def contaminated_texts(texts: Iterable[str], forbidden: Iterable[str], n: int = 13) -> set[str]:
+    """The texts (as given) that equal a forbidden text after normalisation or share a word n-gram with one.
 
-    Texts shorter than n words (typical benchmark queries) can only match exactly after normalisation.
+    Texts shorter than n words (typical benchmark queries, short answers) can only match exactly.
     """
     # Memory: the benchmark side can be millions of texts (MS MARCO-TR alone has 1.1M passages), our side is
     # tens of thousands. So index OUR n-grams and stream the benchmark texts once, remembering which of our
     # n-grams / texts occur there.
+    texts = list(dict.fromkeys(texts))
     ours_exact: set[str] = set()
     ours_grams: set[int] = set()
-    for p in pairs:
-        for text in (p["passage"], p["question"]):
-            ours_exact.add(normalize(text).lower())
-            ours_grams |= _ngram_hashes(text, n)
+    for text in texts:
+        ours_exact.add(normalize(text).lower())
+        ours_grams |= _ngram_hashes(text, n)
     hit_exact: set[str] = set()
     hit_grams: set[int] = set()
     for text in forbidden:
@@ -195,11 +214,27 @@ def decontaminate(pairs: list[Pair], forbidden: Iterable[str], n: int = 13) -> t
         if lowered in ours_exact:
             hit_exact.add(lowered)
         hit_grams.update(g for g in _ngram_hashes(text, n) if g in ours_grams)
+    return {t for t in texts if normalize(t).lower() in hit_exact or _ngram_hashes(t, n) & hit_grams}
 
-    def hit(text: str) -> bool:
-        return normalize(text).lower() in hit_exact or bool(_ngram_hashes(text, n) & hit_grams)
 
-    kept = [p for p in pairs if not hit(p["passage"]) and not hit(p["question"])]
+def decontaminate(
+    pairs: list[Pair], forbidden: Iterable[str], n: int = 13, stats: Optional[dict] = None
+) -> tuple[list[Pair], int]:
+    """Drop pairs whose passage or question equals / shares a word n-gram with a forbidden text.
+
+    A contaminated `answer` only loses the answer (the pair stays); the count goes to stats["answers_removed"].
+    One pass over `forbidden`.
+    """
+    texts = [t for p in pairs for t in (p["passage"], p["question"], p.get("answer")) if t]
+    hits = contaminated_texts(texts, forbidden, n)
+    kept = [p for p in pairs if p["passage"] not in hits and p["question"] not in hits]
+    removed = 0
+    for p in kept:
+        if p.get("answer") in hits:
+            del p["answer"]
+            removed += 1
+    if stats is not None:
+        stats["answers_removed"] = stats.get("answers_removed", 0) + removed
     return kept, len(pairs) - len(kept)
 
 
@@ -325,8 +360,10 @@ def main(argv: Optional[list[str]] = None) -> None:
                        max_q_per_passage=args.max_q_per_passage)
     if args.forbidden:
         forbidden = JsonlTexts(args.forbidden)
-        train, stats["train_dropped_decontamination"] = decontaminate(train, forbidden)
+        answer_stats: dict = {}
+        train, stats["train_dropped_decontamination"] = decontaminate(train, forbidden, stats=answer_stats)
         val, stats["val_dropped_decontamination"] = decontaminate(val, forbidden)
+        stats["train_answers_removed_decontamination"] = answer_stats.get("answers_removed", 0)
 
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -335,6 +372,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     stats["pairs_val"] = _write_jsonl(out / "pairs_val.jsonl", val)
     stats["corpus_train_texts"] = _write_jsonl(out / "corpus_train.jsonl", ({"text": t} for t in texts))
     stats["train_by_source"] = {s: sum(p["source"] == s for p in train) for s in sorted({p["source"] for p in train})}
+    stats["train_with_answer"] = sum("answer" in p for p in train)
     stats["decontaminated"] = bool(args.forbidden)
     (out / "stats.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(stats, ensure_ascii=False, indent=2))

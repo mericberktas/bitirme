@@ -18,6 +18,7 @@ import yaml
 from .config import StudentConfig, _set_dotted, parse_override_value
 
 LOSS_NAMES = ("mnrl", "mnrl_symmetric")
+ANSWER_WEIGHT_MODES = ("none", "fixed", "words", "chars")
 
 
 @dataclass
@@ -30,6 +31,7 @@ class ContrastiveDataConfig:
     # Hard negatives per question (0 = in-batch negatives only). Needs a pairs file written by `mine_negatives`
     # (each row has `neg_passage_ids`); the mined passages are added to the batch's passage pool.
     hard_negatives: int = 0
+    answer_max_length: int = 128  # tokens; answers are spans (TurHistQuAD) or generated sentences (the other two)
 
 
 @dataclass
@@ -44,6 +46,21 @@ class ContrastiveLossConfig:
     # weights). 0 = off. Meant for fine-tuning an already distilled student without forgetting what distillation gave.
     anchor_cosine_weight: float = 0.0
     anchor_gram_weight: float = 0.0
+    # Answer term (needs a pairs file with an `answer` field, see attach_answers): question -> answer InfoNCE over the
+    # batch's answers (other answers are the negatives; identical answers are masked), weighted per pair and added to
+    # the question -> passage loss as mean_i(w_i * CE_i) over the pairs that have an answer.
+    #   none:  off.
+    #   fixed: w_i = answer_weight for every pair.
+    #   words / chars: w_i = answer_weight_min + (answer_weight_max - answer_weight_min) * min(1, length_i / ref), with
+    #          length = word or character count and ref = answer_ref_words / answer_ref_chars; a short answer ("1923")
+    #          says little about the question's meaning and gets the low end. answer_weight_inverse flips the ramp.
+    answer_weight_mode: str = "none"
+    answer_weight: float = 0.3
+    answer_weight_min: float = 0.1
+    answer_weight_max: float = 0.5
+    answer_ref_words: float = 20.0
+    answer_ref_chars: float = 150.0
+    answer_weight_inverse: bool = False
 
 
 @dataclass
@@ -118,6 +135,16 @@ def validate(cfg: ContrastiveConfig) -> None:
         raise ValueError("data.hard_negatives must be >= 0")
     if cfg.loss.anchor_cosine_weight < 0 or cfg.loss.anchor_gram_weight < 0:
         raise ValueError("loss.anchor_cosine_weight and loss.anchor_gram_weight must be >= 0")
+    if cfg.loss.answer_weight_mode not in ANSWER_WEIGHT_MODES:
+        raise ValueError(f"loss.answer_weight_mode must be one of {ANSWER_WEIGHT_MODES}, got {cfg.loss.answer_weight_mode!r}")
+    if min(cfg.loss.answer_weight, cfg.loss.answer_weight_min, cfg.loss.answer_weight_max) < 0:
+        raise ValueError("loss.answer_weight, answer_weight_min and answer_weight_max must be >= 0")
+    if cfg.loss.answer_weight_min > cfg.loss.answer_weight_max:
+        raise ValueError("loss.answer_weight_min must not exceed loss.answer_weight_max")
+    if cfg.loss.answer_ref_words <= 0 or cfg.loss.answer_ref_chars <= 0:
+        raise ValueError("loss.answer_ref_words and loss.answer_ref_chars must be positive")
+    if cfg.data.answer_max_length < 1:
+        raise ValueError("data.answer_max_length must be >= 1")
     if t.batch_size < 2:
         raise ValueError("train.batch_size must be >= 2 (in-batch negatives need other pairs)")
     if t.chunk_size is not None and t.chunk_size < 1:

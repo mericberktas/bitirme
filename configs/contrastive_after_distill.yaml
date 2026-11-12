@@ -30,6 +30,9 @@ data:
   # Mined hard negatives per question (0 = in-batch only); needs a pairs file written by mine_negatives
   # (data/stage1/pairs_train_clean_hn.jsonl), set together with data.pairs_train.
   hard_negatives: 0
+  # Token limit for the answers of the answer term (TurHistQuAD answers are spans, median 2 words; WikiRAG-TR and
+  # Wikipedia-QA answers are generated sentences, WikiRAG median 32 words).
+  answer_max_length: 128
 
 loss:
   name: mnrl
@@ -39,6 +42,18 @@ loss:
   # the notebook turns it on with 10 / 200 for the next round.
   anchor_cosine_weight: 0.0
   anchor_gram_weight: 0.0
+  # Answer term (advisor's idea, 2026-11-11): question -> answer InfoNCE over the batch's answers, weighted per pair and
+  # added as mean(w_i * CE_i). Needs data.pairs_train with an `answer` field (attach_answers ->
+  # pairs_train_clean_ans.jsonl). none = off; fixed = answer_weight for every pair; words / chars = a ramp from
+  # answer_weight_min to answer_weight_max over 0..answer_ref_words words / 0..answer_ref_chars characters (longer
+  # answer, larger weight; answer_weight_inverse flips it). Untuned starting values.
+  answer_weight_mode: none
+  answer_weight: 0.3
+  answer_weight_min: 0.1
+  answer_weight_max: 0.5
+  answer_ref_words: 20
+  answer_ref_chars: 150
+  answer_weight_inverse: false
 
 train:
   batch_size: 128

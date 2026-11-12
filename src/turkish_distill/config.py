@@ -228,6 +228,41 @@ class EvalConfig:
     query_max_length: int = 64
 
 
+JOINT_ANSWER_MODES = ("none", "fixed", "words", "chars")
+
+
+@dataclass
+class JointContrastiveConfig:
+    """Contrastive loss on (question, passage) pairs trained together with the distillation (off while `pairs` is None).
+
+    Every `every`-th step from `start_step` on, a batch of `batch_size` pairs (no passage twice, see
+    `contrastive.unique_passage_batches`) adds `weight` x InfoNCE (question -> in-batch passages, scale `scale`) to the
+    step's gradient, before the optimiser step: the distillation and the contrastive loss form one objective. With
+    `answer_weight_mode` other than none the pairs file must carry answers and the weighted question -> answer term of
+    the contrastive fine-tuning (contrastive.answer_info_nce) is added too, times `weight`. The pair batches follow
+    their own deterministic order (seed train.seed), so a resumed run sees the same batches.
+    """
+
+    pairs: Optional[str] = None
+    weight: float = 0.1
+    batch_size: int = 128
+    every: int = 4
+    start_step: int = 0
+    loss: str = "mnrl"  # or mnrl_symmetric
+    scale: float = 20.0
+    query_max_length: int = 64
+    passage_max_length: int = 512
+    hard_negatives: int = 0  # mined negatives per question (pairs file from mine_negatives)
+    answer_max_length: int = 128
+    answer_weight_mode: str = "none"
+    answer_weight: float = 0.3
+    answer_weight_min: float = 0.1
+    answer_weight_max: float = 0.5
+    answer_ref_words: float = 20.0
+    answer_ref_chars: float = 150.0
+    answer_weight_inverse: bool = False
+
+
 @dataclass
 class ExperimentConfig:
     name: str
@@ -239,6 +274,7 @@ class ExperimentConfig:
     train: TrainConfig = field(default_factory=TrainConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
+    joint: JointContrastiveConfig = field(default_factory=JointContrastiveConfig)
     tensorboard: bool = True
     # Optional local scratch directory; checkpoints are written here first
     # and then moved to output_dir (e.g. Colab /content -> Drive).
@@ -248,7 +284,10 @@ class ExperimentConfig:
         return dataclasses.asdict(self)
 
     def fingerprint(self) -> str:
-        blob = json.dumps(self.to_dict(), sort_keys=True, ensure_ascii=False)
+        data = self.to_dict()
+        if self.joint.pairs is None:
+            data.pop("joint")  # off: the same fingerprint as before the section existed (resumes stay quiet)
+        blob = json.dumps(data, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
 
 
@@ -280,6 +319,7 @@ _SECTIONS = {
     "train": TrainConfig,
     "eval": EvalConfig,
     "fusion": FusionConfig,
+    "joint": JointContrastiveConfig,
 }
 
 
@@ -324,6 +364,20 @@ def load_config(path: str | Path, overrides: Optional[list[str]] = None) -> Expe
 
 
 def validate(cfg: ExperimentConfig) -> None:
+    j = cfg.joint
+    if j.pairs is not None:
+        if j.weight < 0 or j.batch_size < 2 or j.every < 1 or j.start_step < 0 or j.scale <= 0:
+            raise ValueError("joint: weight >= 0, batch_size >= 2, every >= 1, start_step >= 0 and scale > 0 are required")
+        if j.loss not in ("mnrl", "mnrl_symmetric"):
+            raise ValueError(f"joint.loss must be 'mnrl' or 'mnrl_symmetric', got {j.loss!r}")
+        if j.hard_negatives < 0:
+            raise ValueError("joint.hard_negatives must be >= 0")
+        if j.answer_weight_mode not in JOINT_ANSWER_MODES:
+            raise ValueError(f"joint.answer_weight_mode must be one of {JOINT_ANSWER_MODES}, got {j.answer_weight_mode!r}")
+        if min(j.answer_weight, j.answer_weight_min, j.answer_weight_max) < 0 or j.answer_weight_min > j.answer_weight_max:
+            raise ValueError("joint: answer weights must be >= 0 and answer_weight_min <= answer_weight_max")
+        if j.answer_ref_words <= 0 or j.answer_ref_chars <= 0:
+            raise ValueError("joint.answer_ref_words and joint.answer_ref_chars must be positive")
     if cfg.student.head not in ("linear", "mlp"):
         raise ValueError(f"student.head must be 'linear' or 'mlp', got {cfg.student.head!r}")
     if cfg.student.head_hidden < 0:

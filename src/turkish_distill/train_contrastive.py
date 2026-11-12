@@ -27,6 +27,8 @@ from .contrastive import (
     load_pairs,
     make_anchor,
     make_anchor_loss,
+    make_answer_loss,
+    make_answer_weight_fn,
     make_loss,
     unique_passage_batches,
 )
@@ -70,6 +72,7 @@ def run_contrastive(
 
     model.to(device)
     loss_fn = make_loss(cfg.loss)
+    answer_fn = make_answer_loss(cfg.loss)
     anchor_model = anchor_fn = None
     if cfg.loss.anchor_cosine_weight > 0 or cfg.loss.anchor_gram_weight > 0:
         anchor_model = make_anchor(model)  # taken BEFORE a checkpoint is loaded: the starting model, not a resumed one
@@ -91,7 +94,8 @@ def run_contrastive(
             print(f"resumed from {ckpt_path.name} (step {step})", flush=True)
 
     collator = PairCollator(
-        tokenizer, train_pairs, cfg.data.query_max_length, cfg.data.passage_max_length, cfg.data.hard_negatives
+        tokenizer, train_pairs, cfg.data.query_max_length, cfg.data.passage_max_length, cfg.data.hard_negatives,
+        answer_weight_fn=make_answer_weight_fn(cfg.loss), answer_max_length=cfg.data.answer_max_length,
     )
     encode_q = make_student_encode_fn(model, tokenizer, device, cfg.data.query_max_length)
     encode_p = make_student_encode_fn(model, tokenizer, device, cfg.data.passage_max_length, batch_size=64)
@@ -135,7 +139,7 @@ def run_contrastive(
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
             optimizer.zero_grad(set_to_none=True)
-            logs = contrastive_step(model, batch, loss_fn, t.chunk_size, use_amp, anchor_model, anchor_fn)
+            logs = contrastive_step(model, batch, loss_fn, t.chunk_size, use_amp, anchor_model, anchor_fn, answer_fn)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), t.grad_clip)
             optimizer.step()
             scheduler.step()
