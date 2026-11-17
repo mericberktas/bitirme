@@ -272,6 +272,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         print(f"loaded {path.name} (step {step})", flush=True)
     device = get_device()
     model.to(device).train()
+    if cfg.student.query_prefix:
+        from .data import student_texts
+        from .teachers import load_query_set
+
+        texts = student_texts(texts, cfg.student.query_prefix, load_query_set(cfg.student.query_sources))[0]
     collator = Collator(tokenizer, texts, caches, cfg.student.max_length)
     n = len(texts)
     train_idx = np.arange(0, n - min(cfg.data.val_size, max(2, n // 10)))

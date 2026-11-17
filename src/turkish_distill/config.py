@@ -68,7 +68,9 @@ class TeacherConfig:
     reuse_plain_from: Optional[str] = None
 
 
-LOSS_TERMS = {"cosine", "sim", "resim", "listwise"}
+LOSS_TERMS = {"cosine", "sim", "resim", "listwise", "bank", "bank_nce"}
+BANK_FIELDS = ("bank_size", "bank_refresh_every", "bank_kl_weight", "bank_temperature", "bank_student_temperature",
+               "bank_nce_weight", "bank_nce_temperature")
 
 
 def teacher_loss_scale(teacher: TeacherConfig, term: str) -> float:
@@ -97,6 +99,11 @@ class StudentConfig:
     # Optional `teacher_heads.pt` of an earlier run whose projection heads start this run (alternating.py hands the head
     # of a teacher's arm from one round to the next). Loaded strictly: the same teachers, the same head type.
     heads_path: Optional[str] = None
+    # Query instruction the STUDENT sees on the question texts (those in the `question` field of `query_sources`),
+    # during training and in the in-training retrieval check; evaluate the model with the same `--query-prompt`.
+    # The teacher targets are unchanged (the caches are keyed on the plain corpus). Empty = plain text, as before.
+    query_prefix: str = ""
+    query_sources: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -157,6 +164,24 @@ class LossConfig:
     sample_weighting: str = "none"
     sample_weight_temperature: float = 0.05
     sample_weight_floor: float = 0.2
+    # Teacher-bank terms (bank.py; 0 = off). A bank of `bank_size` cached teacher vectors of random TRAINING texts
+    # (redrawn every `bank_refresh_every` steps, 0 = once) gives every text real neighbours, which a batch of 128
+    # random texts does not have. Both terms work in each teacher's own space, on the head output, and exclude the
+    # text itself from the bank.
+    # (A) relational (RRD / SEED / CompRess style): the teacher's distribution of the text over the bank,
+    #     softmax(t . bank / bank_temperature), is the target of the student's, softmax(head(s) . bank /
+    #     bank_student_temperature) (0 = the same temperature; equal temperatures keep the optimum of this term the
+    #     optimum of the vector term, head(s) = t); loss = KL(teacher || student), mean over the texts.
+    # (B) contrastive (CKD / CRD style): InfoNCE, head(s) must be closer to its own teacher vector than to every bank
+    #     vector, temperature `bank_nce_temperature`.
+    # Per teacher: `loss_weights` keys `bank` and `bank_nce`.
+    bank_size: int = 0
+    bank_refresh_every: int = 200
+    bank_kl_weight: float = 0.0
+    bank_temperature: float = 0.02
+    bank_student_temperature: float = 0.0
+    bank_nce_weight: float = 0.0
+    bank_nce_temperature: float = 0.05
 
 
 @dataclass
@@ -287,6 +312,12 @@ class ExperimentConfig:
         data = self.to_dict()
         if self.joint.pairs is None:
             data.pop("joint")  # off: the same fingerprint as before the section existed (resumes stay quiet)
+        if self.loss.bank_size == 0 and self.loss.bank_kl_weight == 0 and self.loss.bank_nce_weight == 0:
+            for key in BANK_FIELDS:  # off: same fingerprint as before these fields existed
+                data["loss"].pop(key)
+        if not self.student.query_prefix and not self.student.query_sources:
+            for key in ("query_prefix", "query_sources"):  # off: same fingerprint as before these fields existed
+                data["student"].pop(key)
         blob = json.dumps(data, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
 
@@ -364,6 +395,15 @@ def load_config(path: str | Path, overrides: Optional[list[str]] = None) -> Expe
 
 
 def validate(cfg: ExperimentConfig) -> None:
+    lo = cfg.loss
+    if lo.bank_size < 0 or lo.bank_refresh_every < 0 or lo.bank_kl_weight < 0 or lo.bank_nce_weight < 0:
+        raise ValueError("loss.bank_size, bank_refresh_every, bank_kl_weight and bank_nce_weight must be >= 0")
+    if (lo.bank_kl_weight > 0 or lo.bank_nce_weight > 0) and lo.bank_size < 1:
+        raise ValueError("loss.bank_kl_weight / bank_nce_weight need loss.bank_size >= 1")
+    if lo.bank_temperature <= 0 or lo.bank_nce_temperature <= 0 or lo.bank_student_temperature < 0:
+        raise ValueError("loss.bank_temperature and bank_nce_temperature must be positive, bank_student_temperature >= 0")
+    if bool(cfg.student.query_prefix) != bool(cfg.student.query_sources):
+        raise ValueError("student.query_prefix and student.query_sources must be given together")
     j = cfg.joint
     if j.pairs is not None:
         if j.weight < 0 or j.batch_size < 2 or j.every < 1 or j.start_step < 0 or j.scale <= 0:

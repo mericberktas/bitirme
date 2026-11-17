@@ -164,6 +164,34 @@ def listwise_kl_loss(student: torch.Tensor, target_probs: torch.Tensor, temperat
     return (q * (torch.log(q.clamp_min(1e-12)) - log_p)).sum(dim=-1).mean()
 
 
+def bank_logits(vectors: torch.Tensor, bank: torch.Tensor, self_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    """Cosines of every (unit) row with every bank vector; the row's own text in the bank gets -1e4 (finite, so
+    softmax gives it exactly 0 without the NaN gradients of -inf)."""
+    sims = F.normalize(vectors.float(), dim=-1) @ bank.T
+    return sims.masked_fill(self_mask, -1e4) if self_mask is not None else sims
+
+
+def bank_kl_loss(
+    pred: torch.Tensor, target: torch.Tensor, bank: torch.Tensor, self_mask: Optional[torch.Tensor],
+    temperature: float, student_temperature: float,
+) -> torch.Tensor:
+    """(A) KL(teacher || student) of the two distributions of every text over the bank, mean over the texts."""
+    t_logp = F.log_softmax(bank_logits(target, bank, self_mask) / temperature, dim=-1)
+    s_logp = F.log_softmax(bank_logits(pred, bank, self_mask) / student_temperature, dim=-1)
+    return (t_logp.exp() * (t_logp - s_logp)).sum(dim=-1).mean()
+
+
+def bank_nce_loss(
+    pred: torch.Tensor, target: torch.Tensor, bank: torch.Tensor, self_mask: Optional[torch.Tensor], temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(B) InfoNCE: the own teacher vector is the positive, the bank the negatives. Returns (loss, top-1 accuracy)."""
+    p = F.normalize(pred.float(), dim=-1)
+    pos = (p * F.normalize(target.float(), dim=-1)).sum(dim=-1, keepdim=True)
+    logits = torch.cat([pos, bank_logits(p, bank, self_mask)], dim=-1) / temperature
+    zeros = torch.zeros(len(logits), dtype=torch.long, device=logits.device)
+    return F.cross_entropy(logits, zeros), (logits.argmax(dim=-1) == 0).float().mean()
+
+
 def gor_loss(emb: torch.Tensor) -> torch.Tensor:
     """Spread-out regulariser: mean squared off-diagonal cosine (second moment only)."""
     x = F.normalize(emb.float(), dim=-1)
@@ -212,6 +240,18 @@ class MultiTeacherLoss(nn.Module):
             raise ValueError("sum of teacher weights must be positive")
         self._seed = seed
         self._generators: dict[str, torch.Generator] = {}
+        self.bank = None  # bank.TeacherBank, set by the training loop when loss.bank_* is on
+        self._batch_indices: Optional[torch.Tensor] = None
+
+    def uses_bank(self) -> bool:
+        return self.cfg.bank_size > 0 and (self.cfg.bank_kl_weight > 0 or self.cfg.bank_nce_weight > 0)
+
+    def set_bank(self, bank) -> None:
+        self.bank = bank
+
+    def set_batch_indices(self, indices) -> None:
+        """Corpus indices of the batch the next forward is computed for (to keep a text out of its own bank)."""
+        self._batch_indices = None if indices is None else torch.as_tensor(indices, dtype=torch.long)
 
     def set_step(self, step: int) -> None:
         """Tell the loss which training step it is computed for (teacher weights may ramp with the step)."""
@@ -264,6 +304,15 @@ class MultiTeacherLoss(nn.Module):
             )
             for name, w in sample_w.items():
                 logs[f"sw/{name}"] = float(w.mean())
+        self_mask = None
+        if self.uses_bank():
+            if self.bank is None or self.bank.indices is None:
+                raise ValueError("loss.bank_* is on but no loaded bank was set (MultiTeacherLoss.set_bank)")
+            if self._batch_indices is not None:
+                if len(self._batch_indices) != len(pooled):
+                    raise ValueError("set_batch_indices does not match the batch size")
+                b_idx = self._batch_indices.to(self.bank.indices.device)
+                self_mask = (b_idx[:, None] == self.bank.indices[None, :]).to(pooled.device)
         shared_gram = None  # (c): the weighted average of the teachers' z-scored Gram vectors
         mixture = None  # listwise term: the weighted mixture of the teachers' row distributions
         mixture_weight = 0.0
@@ -272,7 +321,10 @@ class MultiTeacherLoss(nn.Module):
             if weight == 0.0:
                 continue  # also leaves that teacher's head without gradient (no weight decay either)
             target = targets[name].to(pooled.device)
-            scale = {k: teacher_loss_scale(self._by_name[name], k) for k in ("cosine", "sim", "resim", "listwise")}
+            scale = {
+                k: teacher_loss_scale(self._by_name[name], k)
+                for k in ("cosine", "sim", "resim", "listwise", "bank", "bank_nce")
+            }
             if cfg.listwise_weight and scale["listwise"] > 0:
                 share = weight * scale["listwise"]
                 probs = share * teacher_row_probs(target, cfg.listwise_temperature, cfg.gram_target_std)
@@ -284,6 +336,20 @@ class MultiTeacherLoss(nn.Module):
                 weighted = (sample_w[name] * cos_ps[name]).mean() if name in sample_w else c
                 parts = parts + cfg.cosine_weight * scale["cosine"] * weighted
                 logs[f"cos/{name}"] = float(c.detach())
+            if self.uses_bank():
+                bank_vectors = self.bank.vectors[name].to(pooled.device)
+                if cfg.bank_kl_weight and scale["bank"] > 0:
+                    kl = bank_kl_loss(
+                        projections[name], target, bank_vectors, self_mask, cfg.bank_temperature,
+                        cfg.bank_student_temperature or cfg.bank_temperature,
+                    )
+                    parts = parts + cfg.bank_kl_weight * scale["bank"] * kl
+                    logs[f"bank_kl/{name}"] = float(kl.detach())
+                if cfg.bank_nce_weight and scale["bank_nce"] > 0:
+                    nce, acc = bank_nce_loss(projections[name], target, bank_vectors, self_mask, cfg.bank_nce_temperature)
+                    parts = parts + cfg.bank_nce_weight * scale["bank_nce"] * nce
+                    logs[f"bank_nce/{name}"] = float(nce.detach())
+                    logs[f"bank_acc/{name}"] = float(acc)
             if shared:
                 z = zscore(offdiag_similarities(target))
                 shared_gram = (weight / weight_sum) * z if shared_gram is None else shared_gram + (weight / weight_sum) * z

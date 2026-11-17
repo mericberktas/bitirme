@@ -20,7 +20,7 @@ from tqdm.auto import tqdm
 from .checkpoint import cleanup_stale, latest_checkpoint, load_checkpoint, save_checkpoint
 from .config import ExperimentConfig, TeacherConfig, dump_config, load_config, teacher_weight
 from .contrastive import _capture_rng, _restore_rng, evaluate_retrieval, load_pairs
-from .data import Collator, ListDataset, epoch_batches, load_corpus, neighbor_epoch_batches
+from .data import Collator, ListDataset, epoch_batches, load_corpus, neighbor_epoch_batches, student_texts
 from .diagnostics import effective_rank, geometry_agreement, mean_pairwise_cosine, teacher_cosine
 from .grad_conflict import probe_gradients
 from .gradproj import pcgrad_combine
@@ -219,7 +219,30 @@ def run_training(
                 warnings.warn("config differs from the one the checkpoint was created with")
             print(f"resumed from {ckpt_path.name} (step {step})", flush=True)
 
-    collator = Collator(tokenizer, texts, caches, cfg.student.max_length)
+    queries: set[str] = set()
+    if cfg.student.query_prefix:
+        from .teachers import load_query_set
+
+        queries = load_query_set(cfg.student.query_sources)
+    seen_texts, n_prefixed = student_texts(texts, cfg.student.query_prefix, queries)
+    if cfg.student.query_prefix:
+        print(f"student query prefix on {n_prefixed} of {len(texts)} texts: {cfg.student.query_prefix!r}", flush=True)
+        if n_prefixed == 0:
+            raise ValueError("student.query_prefix is set but none of the corpus texts is in student.query_sources")
+    collator = Collator(tokenizer, seen_texts, caches, cfg.student.max_length)
+    bank = None
+    if criterion.uses_bank():
+        from .bank import TeacherBank
+
+        active = [tc.name for tc in cfg.teachers if tc.name in caches]
+        bank = TeacherBank(caches, train_idx, cfg.loss.bank_size, t.seed, cfg.loss.bank_refresh_every, device, active)
+        criterion.set_bank(bank)
+        print(
+            f"teacher bank: {bank.size} training texts per teacher, redrawn every "
+            f"{cfg.loss.bank_refresh_every or 'never'} steps; KL weight {cfg.loss.bank_kl_weight}, "
+            f"InfoNCE weight {cfg.loss.bank_nce_weight}",
+            flush=True,
+        )
     sts_fn = None
     if sts_data is not None:
         encode_fn = make_student_encode_fn(model, tokenizer, device, cfg.student.max_length)
@@ -232,6 +255,9 @@ def run_training(
     if retrieval_val is not None:
         # Same metric and prefix as the contrastive runs ("val/mrr@10", ...), so all methods are comparable.
         encode_q = make_student_encode_fn(model, tokenizer, device, cfg.eval.query_max_length)
+        if cfg.student.query_prefix:
+            plain_q, prefix = encode_q, cfg.student.query_prefix
+            encode_q = lambda qs: plain_q([prefix + q for q in qs])  # noqa: E731
         encode_p = make_student_encode_fn(model, tokenizer, device, cfg.student.max_length, batch_size=64)
         retrieval_fn = torch.no_grad()(lambda: evaluate_retrieval(encode_q, encode_p, retrieval_val))
 
@@ -299,6 +325,9 @@ def run_training(
             targets = {k: v.to(device) for k, v in batch["targets"].items()}
             optimizer.zero_grad(set_to_none=True)
             criterion.set_step(step)  # `step` steps are done, this is step number `step` (teacher weights may ramp)
+            if bank is not None:
+                bank.at_step(step)
+                criterion.set_batch_indices(batch["indices"])
             if t.grad_probe_every and step % t.grad_probe_every == 0:
                 # measurement only: autograd.grad leaves .grad alone and the RNG state is restored
                 probe = probe_gradients(

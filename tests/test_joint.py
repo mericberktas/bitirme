@@ -13,7 +13,7 @@ from test_answers import answered_pairs
 from test_contrastive import make_pairs, tiny_model
 from test_train_smoke import build
 from turkish_distill import contrastive as ct
-from turkish_distill.config import JointContrastiveConfig, load_config
+from turkish_distill.config import BANK_FIELDS, JointContrastiveConfig, load_config
 from turkish_distill.joint import JointContrastive, joint_loss_config
 from turkish_distill.logging_utils import read_metrics
 from turkish_distill.train import run_training
@@ -116,6 +116,10 @@ def test_config_section_validation_and_fingerprint(tmp_path):
     assert cfg.joint.pairs is None  # off by default
     without = cfg.to_dict()
     without.pop("joint")
+    for key in BANK_FIELDS:  # off by default too (test_bank.py)
+        without["loss"].pop(key)
+    for key in ("query_prefix", "query_sources"):  # off by default too (test_student_prefix.py)
+        without["student"].pop(key)
     blob = json.dumps(without, sort_keys=True, ensure_ascii=False)
     assert cfg.fingerprint() == hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]  # unchanged while off
     on = load_config(path, ["joint.pairs=p.jsonl", "joint.weight=0.1"])

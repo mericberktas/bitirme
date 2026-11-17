@@ -91,6 +91,14 @@ class ListDataset(torch.utils.data.Dataset):
         return self.batches[i]
 
 
+def student_texts(texts: list[str], prefix: str, queries: set[str]) -> tuple[list[str], int]:
+    """The texts as the student sees them: `prefix` added to the question texts. Returns the list and how many got it."""
+    if not prefix:
+        return texts, 0
+    out = [prefix + t if t in queries else t for t in texts]
+    return out, sum(1 for t in texts if t in queries)
+
+
 class Collator:
     """Turns a list of corpus indices into a tokenised batch plus teacher targets."""
 
