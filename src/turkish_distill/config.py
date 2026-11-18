@@ -69,6 +69,17 @@ class TeacherConfig:
 
 
 LOSS_TERMS = {"cosine", "sim", "resim", "listwise", "bank", "bank_nce"}
+# Fields added after runs were made with this code: while a field keeps its default it is left out of the fingerprint,
+# so older runs resume without a "config differs" warning.
+LATE_DEFAULTS = {
+    "train": {
+        "ema_decay": 0.0, "swa_start": 0.0, "swa_every": 200, "sampling": "uniform", "sample_scores": None,
+        "keep_fraction": 0.7, "sampling_power": 1.0, "short_max_length": 0, "short_until": 0.5, "sam_rho": 0.0,
+        "teacher_sampling": "all",
+    },
+    "loss": {"uncertainty_weighting": False, "uncertainty_lr": 0.01},
+}
+SAMPLING_MODES = ("uniform", "prune_easy", "prune_hard", "weighted")
 BANK_FIELDS = ("bank_size", "bank_refresh_every", "bank_kl_weight", "bank_temperature", "bank_student_temperature",
                "bank_nce_weight", "bank_nce_temperature")
 
@@ -182,6 +193,13 @@ class LossConfig:
     bank_student_temperature: float = 0.0
     bank_nce_weight: float = 0.0
     bank_nce_temperature: float = 0.05
+    # Uncertainty weighting (Kendall et al. 2018, multi-task vision; off by default): every (teacher, term) pair gets a
+    # learnable log-variance s, and its weighted loss w * L becomes exp(-s) * w * L + s (equal to w * L at s = 0, the
+    # start). The optimum of s is log(w * L), so the terms are rebalanced towards equal shares as training goes. The
+    # log-variances have their own learning rate `uncertainty_lr` (with the model's lr they would barely move) and no
+    # weight decay. Terms of no single teacher (shared relation target, listwise, gor) are not weighted.
+    uncertainty_weighting: bool = False
+    uncertainty_lr: float = 0.01
 
 
 @dataclass
@@ -239,6 +257,38 @@ class TrainConfig:
     # conflicts with (negative inner product), as in PCGrad / Road MOPD, then the gradients are summed. Applied at the
     # pooled embedding (what gradient caching hands to the encoder), which is where the teachers' terms meet.
     grad_projection: str = "none"
+    # --- Methods adapted from outside NLP (all off by default; see averaging.py, score_texts.py) ---
+    # Weight averaging during training, the training loop's own "soup" (Mean Teacher / EMA, SWA from vision). The
+    # trained model is unchanged; the averages are extra models saved next to it as `final_ema/` and `final_swa/`.
+    # `ema_decay` (0 = off): exponential moving average of all weights after every step (the decay is warmed up as
+    # min(decay, (1 + n) / (10 + n)) over the first updates). `swa_start` (0 = off): uniform average of the weights every
+    # `swa_every` steps from step `swa_start * max_steps` on (stochastic weight averaging over the decaying-lr tail).
+    ema_decay: float = 0.0
+    swa_start: float = 0.0
+    swa_every: int = 200
+    # Which training texts the batches are drawn from (data pruning / importance sampling, from vision: Sorscher et al.
+    # 2022, Katharopoulos & Fleuret 2018). `sample_scores`: a scores file written by score_texts.py (per-text student
+    # error against the teachers, for exactly this corpus). "uniform": every text once per epoch (default).
+    # "prune_easy": only the `keep_fraction` hardest training texts are used (the easiest are dropped). "prune_hard":
+    # only the easiest `keep_fraction` (the hardest, possibly noise, are dropped). "weighted": every batch is drawn with
+    # replacement with probability proportional to score ** `sampling_power` (scores clipped at their 1st percentile so
+    # no text gets probability zero); an "epoch" is still len(train texts) // batch_size batches.
+    sampling: str = "uniform"
+    sample_scores: Optional[str] = None
+    keep_fraction: float = 0.7
+    sampling_power: float = 1.0
+    # Progressive input length (progressive resizing from vision, 0 = off): the student's inputs are cut to
+    # `short_max_length` tokens for the first `short_until` share of the steps, then to student.max_length. Batches are
+    # padded to their longest text, so the short phase is much faster per step. The teacher targets are always those of
+    # the full texts (for long texts the two views then differ during the short phase).
+    short_max_length: int = 0
+    short_until: float = 0.5
+    # Sharpness-aware minimisation (SAM, Foret et al. 2021; 0 = off): the gradient is taken at the weights moved by
+    # `sam_rho` along the normalised gradient, then applied at the original weights. Twice the compute per step.
+    sam_rho: float = 0.0
+    # "all": every teacher in every step (default). "one": one teacher per step, drawn with probability proportional to
+    # the teacher weights (deterministic in seed and step); the others sit the step out.
+    teacher_sampling: str = "all"
 
 
 @dataclass
@@ -318,6 +368,10 @@ class ExperimentConfig:
         if not self.student.query_prefix and not self.student.query_sources:
             for key in ("query_prefix", "query_sources"):  # off: same fingerprint as before these fields existed
                 data["student"].pop(key)
+        for section, defaults in LATE_DEFAULTS.items():
+            for key, default in defaults.items():
+                if data[section].get(key) == default:
+                    data[section].pop(key)
         blob = json.dumps(data, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
 
@@ -396,6 +450,36 @@ def load_config(path: str | Path, overrides: Optional[list[str]] = None) -> Expe
 
 def validate(cfg: ExperimentConfig) -> None:
     lo = cfg.loss
+    tr = cfg.train
+    if tr.ema_decay != 0.0 and not 0.0 < tr.ema_decay < 1.0:
+        raise ValueError("train.ema_decay must be 0 (off) or in (0, 1)")
+    if tr.swa_start != 0.0 and not 0.0 < tr.swa_start < 1.0:
+        raise ValueError("train.swa_start must be 0 (off) or in (0, 1)")
+    if tr.swa_every < 1:
+        raise ValueError("train.swa_every must be >= 1")
+    if tr.sampling not in SAMPLING_MODES:
+        raise ValueError(f"train.sampling must be one of {SAMPLING_MODES}, got {tr.sampling!r}")
+    if tr.sampling != "uniform":
+        if not tr.sample_scores:
+            raise ValueError(f"train.sampling {tr.sampling!r} needs train.sample_scores (a file from score_texts.py)")
+        if tr.neighbor_fraction > 0:
+            raise ValueError("train.sampling and train.neighbor_fraction cannot be combined")
+    if not 0.0 < tr.keep_fraction <= 1.0 or tr.sampling_power < 0:
+        raise ValueError("train.keep_fraction must be in (0, 1] and train.sampling_power >= 0")
+    if tr.short_max_length:
+        if not 0 < tr.short_max_length < cfg.student.max_length or not 0.0 < tr.short_until < 1.0:
+            raise ValueError("train.short_max_length must be in (0, student.max_length) and train.short_until in (0, 1)")
+    if tr.sam_rho < 0:
+        raise ValueError("train.sam_rho must be >= 0")
+    if tr.teacher_sampling not in ("all", "one"):
+        raise ValueError(f"train.teacher_sampling must be 'all' or 'one', got {tr.teacher_sampling!r}")
+    if tr.teacher_sampling == "one" and (len(cfg.teachers) < 2 or cfg.fusion.mode != "none"):
+        raise ValueError("train.teacher_sampling 'one' needs at least two teachers and no fusion")
+    if lo.uncertainty_weighting:
+        if lo.uncertainty_lr <= 0:
+            raise ValueError("loss.uncertainty_lr must be positive")
+        if tr.grad_probe_every:
+            raise ValueError("the gradient probe does not support loss.uncertainty_weighting")
     if lo.bank_size < 0 or lo.bank_refresh_every < 0 or lo.bank_kl_weight < 0 or lo.bank_nce_weight < 0:
         raise ValueError("loss.bank_size, bank_refresh_every, bank_kl_weight and bank_nce_weight must be >= 0")
     if (lo.bank_kl_weight > 0 or lo.bank_nce_weight > 0) and lo.bank_size < 1:

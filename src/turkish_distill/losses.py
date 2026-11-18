@@ -236,12 +236,32 @@ class MultiTeacherLoss(nn.Module):
         self.teachers = list(teachers)
         self._by_name = {t.name: t for t in self.teachers}
         self._step = 0
+        self._active: Optional[set[str]] = None
         if sum(self.current_weights().values()) <= 0:
             raise ValueError("sum of teacher weights must be positive")
         self._seed = seed
         self._generators: dict[str, torch.Generator] = {}
         self.bank = None  # bank.TeacherBank, set by the training loop when loss.bank_* is on
         self._batch_indices: Optional[torch.Tensor] = None
+        # self._active (set in __init__ above): train.teacher_sampling "one", the teacher(s) of this step
+        # loss.uncertainty_weighting: one learnable log-variance per (teacher, term), starting at 0 (= the fixed weights)
+        self.log_vars = nn.ParameterDict()
+        if loss_cfg.uncertainty_weighting:
+            for t in self.teachers:
+                for term in ("cosine", "sim", "resim", "bank", "bank_nce"):
+                    self.log_vars[f"{t.name}__{term}"] = nn.Parameter(torch.zeros(()))
+
+    def _uw(self, name: str, term: str, value: torch.Tensor, logs: dict[str, float]) -> torch.Tensor:
+        """Uncertainty weighting of one weighted term: exp(-s) * value + s (identity while off)."""
+        if not self.cfg.uncertainty_weighting:
+            return value
+        s = self.log_vars[f"{name}__{term}"]
+        logs[f"uw/{name}/{term}"] = float(torch.exp(-s).detach())
+        return torch.exp(-s) * value + s
+
+    def set_active(self, names: Optional[list[str]]) -> None:
+        """Restrict the next forward passes to these teachers (None = all); the others get weight 0."""
+        self._active = None if names is None else set(names)
 
     def uses_bank(self) -> bool:
         return self.cfg.bank_size > 0 and (self.cfg.bank_kl_weight > 0 or self.cfg.bank_nce_weight > 0)
@@ -258,7 +278,10 @@ class MultiTeacherLoss(nn.Module):
         self._step = int(step)
 
     def current_weights(self) -> dict[str, float]:
-        return {t.name: teacher_weight(t, self._step) for t in self.teachers}
+        weights = {t.name: teacher_weight(t, self._step) for t in self.teachers}
+        if self._active is not None:
+            weights = {name: (w if name in self._active else 0.0) for name, w in weights.items()}
+        return weights
 
     def _generator(self, device: torch.device) -> torch.Generator:
         key = str(device)
@@ -334,7 +357,7 @@ class MultiTeacherLoss(nn.Module):
             if name in cos_ps:
                 c = cos_ps[name].mean()
                 weighted = (sample_w[name] * cos_ps[name]).mean() if name in sample_w else c
-                parts = parts + cfg.cosine_weight * scale["cosine"] * weighted
+                parts = parts + self._uw(name, "cosine", cfg.cosine_weight * scale["cosine"] * weighted, logs)
                 logs[f"cos/{name}"] = float(c.detach())
             if self.uses_bank():
                 bank_vectors = self.bank.vectors[name].to(pooled.device)
@@ -343,11 +366,11 @@ class MultiTeacherLoss(nn.Module):
                         projections[name], target, bank_vectors, self_mask, cfg.bank_temperature,
                         cfg.bank_student_temperature or cfg.bank_temperature,
                     )
-                    parts = parts + cfg.bank_kl_weight * scale["bank"] * kl
+                    parts = parts + self._uw(name, "bank", cfg.bank_kl_weight * scale["bank"] * kl, logs)
                     logs[f"bank_kl/{name}"] = float(kl.detach())
                 if cfg.bank_nce_weight and scale["bank_nce"] > 0:
                     nce, acc = bank_nce_loss(projections[name], target, bank_vectors, self_mask, cfg.bank_nce_temperature)
-                    parts = parts + cfg.bank_nce_weight * scale["bank_nce"] * nce
+                    parts = parts + self._uw(name, "bank_nce", cfg.bank_nce_weight * scale["bank_nce"] * nce, logs)
                     logs[f"bank_nce/{name}"] = float(nce.detach())
                     logs[f"bank_acc/{name}"] = float(acc)
             if shared:
@@ -359,7 +382,7 @@ class MultiTeacherLoss(nn.Module):
                         pooled, target, cfg.gram_standardize, cfg.gram_target_mean, cfg.gram_target_std,
                         cfg.sim_row_centered,
                     )
-                    parts = parts + cfg.sim_weight * scale["sim"] * s
+                    parts = parts + self._uw(name, "sim", cfg.sim_weight * scale["sim"] * s, logs)
                     logs[f"sim/{name}"] = float(s.detach())
                 if cfg.resim_weight and scale["resim"] > 0:
                     r = relative_similarity_loss(
@@ -369,7 +392,7 @@ class MultiTeacherLoss(nn.Module):
                         cfg.resim_num_samples,
                         self._generator(pooled.device),
                     )
-                    parts = parts + cfg.resim_weight * scale["resim"] * r
+                    parts = parts + self._uw(name, "resim", cfg.resim_weight * scale["resim"] * r, logs)
                     logs[f"resim/{name}"] = float(r.detach())
             total = total + (weight / weight_sum) * parts
             if parts_out is not None:

@@ -10,7 +10,7 @@ import yaml
 
 from conftest import CharTokenizer, make_texts
 from test_train_smoke import build
-from turkish_distill.config import BANK_FIELDS, load_config
+from turkish_distill.config import BANK_FIELDS, LATE_DEFAULTS, load_config
 from turkish_distill.data import student_texts
 from turkish_distill.train import run_training
 
@@ -82,6 +82,9 @@ def test_config_validation_and_fingerprint(tmp_path):
         data["loss"].pop(key)
     for key in ("query_prefix", "query_sources"):
         data["student"].pop(key)
+    for section, defaults in LATE_DEFAULTS.items():  # off by default too (test_nonnlp.py)
+        for key in defaults:
+            data[section].pop(key)
     blob = json.dumps(data, sort_keys=True, ensure_ascii=False)
     assert cfg.fingerprint() == hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]  # unchanged while off
     on = load_config(path, ["student.query_prefix=Q:", "student.query_sources=[q.jsonl]"])

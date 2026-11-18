@@ -17,10 +17,20 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from .averaging import make_averagers
 from .checkpoint import cleanup_stale, latest_checkpoint, load_checkpoint, save_checkpoint
 from .config import ExperimentConfig, TeacherConfig, dump_config, load_config, teacher_weight
 from .contrastive import _capture_rng, _restore_rng, evaluate_retrieval, load_pairs
-from .data import Collator, ListDataset, epoch_batches, load_corpus, neighbor_epoch_batches, student_texts
+from .data import (
+    Collator,
+    ListDataset,
+    epoch_batches,
+    load_corpus,
+    neighbor_epoch_batches,
+    sampling_plan,
+    student_texts,
+    weighted_epoch_batches,
+)
 from .diagnostics import effective_rank, geometry_agreement, mean_pairwise_cosine, teacher_cosine
 from .grad_conflict import probe_gradients
 from .gradproj import pcgrad_combine
@@ -127,6 +137,31 @@ def distill_step(
 
 
 @torch.no_grad()
+def sam_perturb(model: torch.nn.Module, rho: float) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """SAM's ascent step: move every parameter with a gradient by rho * g / ||g|| (global norm). Returns the
+    (parameter, offset) pairs to subtract afterwards."""
+    params = [p for p in model.parameters() if p.grad is not None]
+    if not params:
+        return []
+    norm = torch.norm(torch.stack([p.grad.detach().float().norm() for p in params]))
+    scale = rho / (float(norm) + 1e-12)
+    moved = []
+    for p in params:
+        e = p.grad.detach() * scale
+        p.add_(e)
+        moved.append((p, e))
+    return moved
+
+
+def pick_teacher(weights: dict[str, float], seed: int, step: int) -> str:
+    """train.teacher_sampling "one": the teacher of a step, drawn with probability proportional to its weight."""
+    names = [n for n, w in weights.items() if w > 0]
+    probs = np.array([weights[n] for n in names], dtype=np.float64)
+    rng = np.random.default_rng([seed, 31, step])
+    return names[int(rng.choice(len(names), p=probs / probs.sum()))]
+
+
+@torch.no_grad()
 def run_diagnostics(
     model: StudentEncoder,
     collator: Collator,
@@ -197,14 +232,26 @@ def run_training(
     val_n = min(cfg.data.val_size, max(2, n // 10))
     train_idx = np.arange(0, n - val_n)
     val_idx = np.arange(n - val_n, n)
+    sample_probs = None
+    if t.sampling != "uniform":
+        from .score_texts import load_scores
+        from .teachers import corpus_fingerprint as _fingerprint
+
+        scores = load_scores(t.sample_scores, _fingerprint(texts), n)
+        train_idx, sample_probs, plan = sampling_plan(train_idx, scores, t.sampling, t.keep_fraction, t.sampling_power)
+        print(f"sampling: {plan}", flush=True)
     steps_per_epoch = len(train_idx) // t.batch_size
     if steps_per_epoch == 0:
         raise ValueError(f"not enough training texts ({len(train_idx)}) for batch size {t.batch_size}")
 
     model.to(device)
-    criterion = MultiTeacherLoss(cfg.loss, cfg.teachers, seed=t.seed)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=t.lr, weight_decay=t.weight_decay)
+    criterion = MultiTeacherLoss(cfg.loss, cfg.teachers, seed=t.seed).to(device)
+    groups = [{"params": list(model.parameters()), "lr": t.lr, "weight_decay": t.weight_decay}]
+    if len(criterion.log_vars):
+        groups.append({"params": list(criterion.log_vars.parameters()), "lr": cfg.loss.uncertainty_lr, "weight_decay": 0.0})
+    optimizer = torch.optim.AdamW(groups, lr=t.lr, weight_decay=t.weight_decay)
     scheduler = build_scheduler(optimizer, t.max_steps, t.warmup_ratio)
+    averagers = make_averagers(t)
 
     step = 0
     if resume:
@@ -215,6 +262,11 @@ def run_training(
             optimizer.load_state_dict(state["optimizer"])
             scheduler.load_state_dict(state["scheduler"])
             step = int(state["step"])
+            if "criterion" in state:
+                criterion.load_state_dict(state["criterion"])
+            for key, avg_state in state.get("averagers", {}).items():
+                if key in averagers:
+                    averagers[key].load_state_dict(avg_state, device)
             if state.get("config_fingerprint") != cfg.fingerprint():
                 warnings.warn("config differs from the one the checkpoint was created with")
             print(f"resumed from {ckpt_path.name} (step {step})", flush=True)
@@ -229,7 +281,23 @@ def run_training(
         print(f"student query prefix on {n_prefixed} of {len(texts)} texts: {cfg.student.query_prefix!r}", flush=True)
         if n_prefixed == 0:
             raise ValueError("student.query_prefix is set but none of the corpus texts is in student.query_sources")
-    collator = Collator(tokenizer, seen_texts, caches, cfg.student.max_length)
+    collator = Collator(tokenizer, seen_texts, caches, cfg.student.max_length)  # diagnostics: always full length
+    train_collator = Collator(tokenizer, seen_texts, caches, cfg.student.max_length)
+    short_steps = int(round(t.short_until * t.max_steps)) if t.short_max_length else 0
+
+    def input_length(at_step: int) -> int:
+        return t.short_max_length if at_step < short_steps else cfg.student.max_length
+
+    if short_steps:
+        print(f"progressive length: {t.short_max_length} tokens for steps 0-{short_steps - 1}, then {cfg.student.max_length}", flush=True)
+    if averagers:
+        print("weight averaging: " + ", ".join(
+            f"{k} ({'decay ' + str(a.decay) if a.mode == 'ema' else f'every {a.every} steps from step {a.start_step}'})"
+            for k, a in averagers.items()), flush=True)
+    if t.sam_rho:
+        print(f"SAM: rho {t.sam_rho} (two forward/backward passes per step)", flush=True)
+    if t.teacher_sampling == "one":
+        print("teacher sampling: one teacher per step, drawn with the teacher weights", flush=True)
     bank = None
     if criterion.uses_bank():
         from .bank import TeacherBank
@@ -300,6 +368,8 @@ def run_training(
                 "scheduler": scheduler.state_dict(),
                 "step": at_step,
                 "config_fingerprint": cfg.fingerprint(),
+                **({"criterion": criterion.state_dict()} if len(criterion.log_vars) else {}),
+                **({"averagers": {k: a.state_dict() for k, a in averagers.items()}} if averagers else {}),
             },
             ckpt_dir,
             at_step,
@@ -316,15 +386,24 @@ def run_training(
             batches = neighbor_epoch_batches(
                 train_idx, neighbor_labels, t.batch_size, t.seed, epoch, t.neighbor_fraction, t.neighbor_group_size, offset
             )
+        elif sample_probs is not None:
+            batches = weighted_epoch_batches(train_idx, sample_probs, t.batch_size, t.seed, epoch, offset)
         else:
             batches = epoch_batches(train_idx, t.batch_size, t.seed, epoch, offset)
-        loader = DataLoader(ListDataset(batches), batch_size=None, collate_fn=collator, num_workers=t.num_workers)
+        loader_length = input_length(step)
+        train_collator.max_length = loader_length  # workers copy the collator when the loader starts iterating
+        loader = DataLoader(ListDataset(batches), batch_size=None, collate_fn=train_collator, num_workers=t.num_workers)
         for batch in loader:
+            if input_length(step) != loader_length:
+                break  # length switch: rebuild the loader from this step on (the batch is not consumed)
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             targets = {k: v.to(device) for k, v in batch["targets"].items()}
             optimizer.zero_grad(set_to_none=True)
             criterion.set_step(step)  # `step` steps are done, this is step number `step` (teacher weights may ramp)
+            if t.teacher_sampling == "one":
+                criterion.set_active(None)
+                criterion.set_active([pick_teacher(criterion.current_weights(), t.seed, step)])
             if bank is not None:
                 bank.at_step(step)
                 criterion.set_batch_indices(batch["indices"])
@@ -340,6 +419,17 @@ def run_training(
                 model, criterion, input_ids, attention_mask, targets, t.chunk_size, use_amp,
                 projection=t.grad_projection, generator=projection_generator,
             )
+            if t.sam_rho:
+                moved = sam_perturb(model, t.sam_rho)  # the gradient at the perturbed weights is the one applied
+                optimizer.zero_grad(set_to_none=True)
+                sam_logs = distill_step(
+                    model, criterion, input_ids, attention_mask, targets, t.chunk_size, use_amp,
+                    projection=t.grad_projection, generator=projection_generator,
+                )
+                with torch.no_grad():
+                    for p, e in moved:
+                        p.sub_(e)
+                logs["sam_total"] = sam_logs["total"]
             if joint is not None and joint.applies(step):
                 # adds its gradient to the distillation gradient: one objective, one optimiser step
                 for k, v in joint.step(model, step, device).items():
@@ -349,6 +439,8 @@ def run_training(
             optimizer.step()
             scheduler.step()
             step += 1
+            for averager in averagers.values():
+                averager.update(model, step, force=step == t.max_steps)
 
             for k, v in logs.items():
                 window[k] = window.get(k, 0.0) + v
@@ -382,6 +474,13 @@ def run_training(
     if last_saved != step:
         save(step)
     model.save_backbone(run_dir / "final", tokenizer)
+    for key, averager in averagers.items():
+        if averager.avg is None:
+            continue
+        with averager.applied(model):
+            model.save_backbone(run_dir / f"final_{key}", tokenizer)
+            logger.log(step, diagnostics(), prefix=f"diag_{key}/")
+        print(f"saved the {key} average of {averager.count} weight snapshots to final_{key}/", flush=True)
     logger.flush()
     if own_logger:
         logger.close()

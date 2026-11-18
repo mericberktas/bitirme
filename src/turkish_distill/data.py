@@ -177,3 +177,44 @@ def neighbor_epoch_batches(
         pool_at += need
         batches.append(batch)
     return batches[start_batch:]
+
+
+def weighted_epoch_batches(
+    train_idx: np.ndarray, probs: np.ndarray, batch_size: int, seed: int, epoch: int, start_batch: int = 0
+) -> list[list[int]]:
+    """Importance sampling: `len(train_idx) // batch_size` batches drawn with replacement, text `train_idx[k]` with
+    probability `probs[k]` (sums to one). Deterministic in (seed, epoch), like `epoch_batches`; a text may appear
+    twice in one batch (rare with many texts)."""
+    steps = len(train_idx) // batch_size
+    rng = np.random.default_rng([seed, 17, epoch])
+    drawn = rng.choice(train_idx, size=steps * batch_size, replace=True, p=probs)
+    return [drawn[i * batch_size : (i + 1) * batch_size].tolist() for i in range(start_batch, steps)]
+
+
+def sampling_plan(train_idx: np.ndarray, scores: np.ndarray, mode: str, keep_fraction: float, power: float):
+    """Apply `train.sampling` to the training indices. Returns (indices, probs or None, summary).
+
+    "prune_easy" keeps the `keep_fraction` highest-scoring (hardest) texts, "prune_hard" the lowest-scoring ones,
+    "weighted" keeps all texts and gives each a probability proportional to max(score, 1st percentile) ** power."""
+    s = scores[train_idx]
+    summary = {"mode": mode, "texts": int(len(train_idx)), "score_mean_all": float(s.mean())}
+    if mode == "uniform":
+        return train_idx, None, summary
+    if mode in ("prune_easy", "prune_hard"):
+        keep = max(1, int(round(keep_fraction * len(train_idx))))
+        order = np.argsort(s, kind="stable")
+        chosen = order[-keep:] if mode == "prune_easy" else order[:keep]
+        kept = np.sort(train_idx[chosen])
+        summary.update(kept=int(len(kept)), score_mean_kept=float(scores[kept].mean()))
+        return kept, None, summary
+    if mode == "weighted":
+        floor = max(float(np.quantile(s, 0.01)), 1e-8)
+        w = np.maximum(s, floor) ** power
+        probs = w / w.sum()
+        summary.update(
+            score_mean_sampled=float((probs * s).sum()),
+            max_over_mean_prob=float(probs.max() * len(probs)),
+            effective_texts=float(1.0 / (probs**2).sum()),
+        )
+        return train_idx, probs, summary
+    raise ValueError(f"unknown sampling mode {mode!r}")
