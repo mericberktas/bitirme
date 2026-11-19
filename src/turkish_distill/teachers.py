@@ -178,6 +178,43 @@ def _encode_chunk(
     return out
 
 
+def seed_cache_from(
+    teacher: TeacherConfig,
+    texts: list[str],
+    old_texts: list[str],
+    cache_root: str | Path,
+    shard_size: int,
+    verbose: bool = True,
+) -> int:
+    """Copy the shards of a completed cache of `old_texts` into the cache of `texts` wherever a whole shard holds the
+    same texts at the same positions (e.g. a bigger corpus that starts with the old one). Returns the shards copied.
+    Only for teachers without a query prefix: which texts get the prefix depends on the query sources."""
+    if teacher.query_prefix:
+        raise ValueError(f"teacher {teacher.name}: seeding is only for plain teachers (it has a query prefix)")
+    old = TeacherCache.open(cache_root, teacher, corpus_fingerprint(old_texts), len(old_texts))
+    if old.meta.get("shard_size") != shard_size:
+        raise ValueError(f"teacher {teacher.name}: the old cache used shard_size {old.meta.get('shard_size')}, not {shard_size}")
+    for key in ("doc_prefix", "max_length", "dtype"):
+        if old.meta.get(key) != getattr(teacher, key):
+            raise ValueError(f"teacher {teacher.name}: the old cache used {key}={old.meta.get(key)!r}, config {getattr(teacher, key)!r}")
+    directory = cache_dir_for(cache_root, teacher, corpus_fingerprint(texts))
+    directory.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for shard in range(min(len(texts), len(old_texts)) // shard_size):
+        lo, hi = shard * shard_size, (shard + 1) * shard_size
+        target = _shard_path(directory, shard)
+        if target.exists() or texts[lo:hi] != old_texts[lo:hi]:
+            continue
+        tmp = target.with_suffix(".npy.tmp")
+        with open(_shard_path(old.directory, shard), "rb") as src, open(tmp, "wb") as dst:
+            dst.write(src.read())
+        os.replace(tmp, target)
+        copied += 1
+    if verbose:
+        print(f"[{teacher.name}] {copied} shards copied from {old.directory}", flush=True)
+    return copied
+
+
 def encode_teacher(
     teacher: TeacherConfig,
     texts: list[str],

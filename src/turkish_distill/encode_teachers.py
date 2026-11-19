@@ -10,11 +10,12 @@ folder. Two sessions on the same teacher are stopped by a lock file (`--ignore-l
 from __future__ import annotations
 
 import argparse
+import dataclasses
 from typing import Optional
 
 from .config import load_config
 from .data import load_corpus
-from .teachers import cache_status, corpus_fingerprint, encode_teacher
+from .teachers import cache_status, corpus_fingerprint, encode_teacher, seed_cache_from
 
 
 def format_status(status: dict) -> str:
@@ -31,6 +32,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--only", action="append", default=[], help="teacher name (repeatable); default: all")
     parser.add_argument("--override", action="append", default=[])
     parser.add_argument("--status", action="store_true", help="report the cache progress and exit (no model is loaded)")
+    parser.add_argument("--seed-from-corpus", default=None,
+                        help="an older corpus whose completed caches hold some of the same shards (same texts at the same "
+                             "positions, e.g. a prefix): copy those shards first, plain teachers only")
     parser.add_argument("--ignore-lock", action="store_true", help="encode even if another session's lock is fresh")
     args = parser.parse_args(argv)
 
@@ -47,6 +51,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         for teacher in selected:
             print(format_status(cache_status(teacher, cfg.data.cache_dir, fingerprint, len(texts), cfg.data.shard_size)), flush=True)
         return
+    if args.seed_from_corpus:
+        old_texts = load_corpus(dataclasses.replace(cfg.data, corpus_path=args.seed_from_corpus), cfg.train.seed)
+        for teacher in selected:
+            seed_cache_from(teacher, texts, old_texts, cfg.data.cache_dir, cfg.data.shard_size)
     for teacher in selected:
         path = encode_teacher(
             teacher, texts, cfg.data.cache_dir, cfg.data.shard_size, fingerprint=fingerprint, ignore_lock=args.ignore_lock
