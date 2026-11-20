@@ -1,0 +1,83 @@
+# Main-line recipe (1k-base student, BGE-M3 + instructed 8K-embed, lr 1e-4, 21,600 steps) on mix v3 plus the domain
+# texts: mix v3 (400K) with the 50,000 thesis abstracts/titles and tech/gaming forum posts of the domain pilot inserted
+# before its 2,000-text validation tail (turkish_distill.domain_mix --extend-from data/mix/mix_domain_250k.jsonl).
+# 450,000 texts, fingerprint 47380f3004a8b2eb; the first 39 cache shards of the plain teachers are the v3 ones
+# (encode_teachers --seed-from-corpus), 6 are encoded. The 8K teacher gets the query instruction on 90,000 questions
+# (the 80,000 of v3 + the 10,000 question-like forum posts).
+# Why: at 5400 steps the domain texts raised SciFact by 3.7 (Mean(task) +0.19, 67.16 -> 67.35); this tests the effect at
+# the full budget. Reference: main_v3_s21600, TR-MTEB 68.11; the only change is the corpus.
+
+name: mix_v3dom_two_instr8k
+output_dir: /content/drive/MyDrive/bitirme/runs
+local_tmp_dir: /content/ckpt_staging
+tensorboard: true
+
+teachers:
+  - name: bge_m3
+    hf_id: BAAI/bge-m3
+    revision: 5617a9f61b028005a4858fdac845db406aefb181
+    dim: 1024
+    doc_prefix: ""
+    max_length: 512
+    batch_size: 64
+    dtype: float16
+    weight: 1.0
+  - name: modernbert_tr_embed_instr
+    hf_id: ytu-ce-cosmos/modernbert-tr-embed
+    revision: 855820e0079102805908d60d32cd9fd59c970b80
+    dim: 768
+    doc_prefix: ""
+    max_length: 512
+    batch_size: 64
+    dtype: float32
+    weight: 1.0
+    # Model card (config_sentence_transformers.json, "query" prompt): a real line break and NO space after "Query:".
+    # Only the questions of the mix (90,000 of 450,000 texts) get it; everything else is copied from the plain cache.
+    query_prefix: "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
+    query_sources:
+      - /content/drive/MyDrive/bitirme/data/mix/mix_v3dom_450k_questions.jsonl
+    reuse_plain_from: modernbert_tr_embed
+
+student:
+  hf_id: ytu-ce-cosmos/modernbert-tr-base-1k
+  revision: c2e35f553101cce5b03fbb318ef8728473fd34dd
+  max_length: 512
+  pooling: mean
+
+data:
+  corpus_path: /content/drive/MyDrive/bitirme/data/mix/mix_v3dom_450k.jsonl
+  text_column: text
+  cache_dir: /content/drive/MyDrive/bitirme/cache/teachers
+  shard_size: 10000
+  max_samples: null
+  min_chars: 10
+  val_size: 2000
+
+loss:
+  cosine_weight: 10.0
+  sim_weight: 200.0
+  resim_weight: 20.0
+  resim_margin: 0.015
+  resim_num_samples: 4096
+  gor_weight: 0.0
+
+train:
+  batch_size: 128
+  chunk_size: 32             # gradient caching: same maths, memory of 32 texts (null ran out of memory on an L4)
+  lr: 1.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_steps: 21600
+  grad_clip: 1.0
+  bf16: true
+  seed: 42
+  num_workers: 2
+  log_every: 25
+  diag_every: 300
+  ckpt_every: 300
+  keep_last: 2
+
+eval:
+  sts_dataset: null
+  pairs_val: /content/drive/MyDrive/bitirme/data/stage1/pairs_val.jsonl
+  query_max_length: 64

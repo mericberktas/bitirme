@@ -87,3 +87,27 @@ def test_build_domain_mix_layout(tmp_path):
     assert stats["quotas"] == dm.quotas(40)
     with pytest.raises(ValueError, match="ran out"):
         dm.build_domain_mix(base, theses, [forum], tmp_path / "x.jsonl", n_new=2000, tail=5, forum_threads=80)
+
+
+def test_extend_mix_moves_domain_rows_into_another_base(tmp_path):
+    def write(path, rows):
+        path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
+
+    base_rows = [{"text": f"v3 metni {i}"} for i in range(30)]
+    donor_rows = [{"text": f"eski karma {i}"} for i in range(10)] + [
+        {"text": "tez özeti bir", "bucket": "thesis_abstracts", "source": "theses"},
+        {"text": "forum sorusu nasıl?", "bucket": "forum_questions", "source": "forum"},
+        {"text": "forum cevabı", "bucket": "forum_replies", "source": "forum"},
+        {"text": "v3 metni 3", "bucket": "forum_replies", "source": "forum"},  # already in the base: dropped
+    ]
+    base, donor, bq = tmp_path / "base.jsonl", tmp_path / "donor.jsonl", tmp_path / "bq.jsonl"
+    write(base, base_rows)
+    write(donor, donor_rows)
+    write(bq, [{"question": "eski soru?"}])
+    out, qout = tmp_path / "out.jsonl", tmp_path / "q.jsonl"
+    stats = dm.extend_mix(base, donor, out, qout, bq, tail=4)
+    rows = [json.loads(line) for line in open(out, encoding="utf-8")]
+    assert len(rows) == 33 and stats["dropped_duplicates"] == 1
+    assert rows[:26] == base_rows[:26] and rows[-4:] == base_rows[-4:]
+    assert [r["text"] for r in rows[26:29]] == ["tez özeti bir", "forum sorusu nasıl?", "forum cevabı"]
+    assert [json.loads(line)["question"] for line in open(qout, encoding="utf-8")] == ["eski soru?", "forum sorusu nasıl?"]

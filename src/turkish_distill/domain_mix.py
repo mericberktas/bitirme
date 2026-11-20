@@ -279,11 +279,59 @@ def build_domain_mix(
     return stats
 
 
+DOMAIN_SOURCES = ("theses", "forum")
+QUESTION_BUCKETS = ("forum_questions",)
+
+
+def extend_mix(
+    base: str | Path,
+    donor: str | Path,
+    out: str | Path,
+    questions_out: Optional[str | Path] = None,
+    base_questions: Optional[str | Path] = None,
+    tail: int = 2000,
+) -> dict:
+    """Put the domain texts of an already built domain mix (`donor`, rows with source theses/forum) into another base
+    mix (e.g. mix v3): base[:-tail] + domain rows + base[-tail:], so the base's cache shards stay copyable. No raw data
+    is needed (the donor's texts are already cleaned and decontaminated); they are only deduplicated against the base.
+    With `questions_out`: the base question list plus the donor's question-like forum posts (for an instructed
+    teacher)."""
+    base_rows = list(_read_jsonl(base))
+    seen = {r["text"].strip() for r in base_rows}
+    new_rows, dropped = [], 0
+    for r in _read_jsonl(donor):
+        if r.get("source") in DOMAIN_SOURCES:
+            if r["text"].strip() in seen:
+                dropped += 1
+                continue
+            seen.add(r["text"].strip())
+            new_rows.append(r)
+    rows = base_rows[: len(base_rows) - tail] + new_rows + base_rows[len(base_rows) - tail:]
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    _write_jsonl(out, rows)
+    stats = {"base": str(base), "donor": str(donor), "base_texts": len(base_rows), "tail": tail,
+             "new_texts": len(new_rows), "dropped_duplicates": dropped, "total": len(rows),
+             "buckets": dict(Counter(r["bucket"] for r in new_rows))}
+    if questions_out:
+        questions = [r["question"] for r in _read_jsonl(base_questions)] if base_questions else []
+        questions += [r["text"] for r in new_rows if r.get("bucket") in QUESTION_BUCKETS]
+        _write_jsonl(Path(questions_out), ({"question": q} for q in questions))
+        stats["questions"] = len(questions)
+    with open(out.with_suffix(".mix.json"), "w", encoding="utf-8") as f:
+        json.dump(stats, f, indent=2, ensure_ascii=False)
+    return stats
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     p = argparse.ArgumentParser(description="200K mix plus Turkish thesis abstracts and tech/gaming forum texts")
     p.add_argument("--base", required=True)
-    p.add_argument("--theses", required=True, help="tezler.parquet of umutertugrul/turkish-academic-theses-dataset")
-    p.add_argument("--forum", nargs="+", required=True, help="ForumSohbetleri forum directories (JSONL files)")
+    p.add_argument("--theses", help="tezler.parquet of umutertugrul/turkish-academic-theses-dataset")
+    p.add_argument("--forum", nargs="+", help="ForumSohbetleri forum directories (JSONL files)")
+    p.add_argument("--extend-from", default=None,
+                   help="an already built domain mix: copy its domain texts into --base instead of building them")
+    p.add_argument("--base-questions", default=None, help="with --extend-from: the base mix's question list")
+    p.add_argument("--questions-out", default=None, help="with --extend-from: write base questions + forum questions")
     p.add_argument("--forbidden", nargs="*", default=None)
     p.add_argument("--out", required=True)
     p.add_argument("--n-new", type=int, default=50_000)
@@ -292,8 +340,13 @@ def main(argv: Optional[list[str]] = None) -> None:
     p.add_argument("--min-tail-count", type=int, default=8)
     p.add_argument("--seed", type=int, default=42)
     a = p.parse_args(argv)
-    stats = build_domain_mix(a.base, a.theses, a.forum, a.out, a.forbidden, a.n_new, a.tail, None,
-                             a.forum_threads, a.min_tail_count, a.seed)
+    if a.extend_from:
+        stats = extend_mix(a.base, a.extend_from, a.out, a.questions_out, a.base_questions, a.tail)
+    else:
+        if not a.theses or not a.forum:
+            p.error("--theses and --forum are required unless --extend-from is given")
+        stats = build_domain_mix(a.base, a.theses, a.forum, a.out, a.forbidden, a.n_new, a.tail, None,
+                                 a.forum_threads, a.min_tail_count, a.seed)
     print(json.dumps(stats, indent=2, ensure_ascii=False))
 
 
