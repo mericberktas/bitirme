@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import argparse
+import math
+import re
 import dataclasses
 import time
 import warnings
@@ -39,12 +41,15 @@ from .eval.sts import evaluate_sts, load_sts_pairs, make_student_encode_fn
 from .logging_utils import MetricsLogger
 from .losses import MultiTeacherLoss
 from .models import StudentEncoder
-from .targets import ArrayCache, CenteredCache, PCACache, cached_neighbor_clusters, fuse_teachers, geometry_report
+from .targets import ArrayCache, CenteredCache, ConcatCache, PCACache, cached_neighbor_clusters, fuse_teachers, geometry_report
 from .teachers import TeacherCache, corpus_fingerprint
 from .utils import describe_device, get_device, git_sha, set_seed, write_env_info
 
 
-def build_scheduler(optimizer: torch.optim.Optimizer, total_steps: int, warmup_ratio: float):
+def build_scheduler(optimizer: torch.optim.Optimizer, total_steps: int, warmup_ratio: float, t=None):
+    """Warmup then linear decay to 0 over all steps; with `t.stage_lrs` a restart at every freezing stage instead."""
+    if t is not None and t.stage_lrs is not None:
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, staged_lr_factor(t))
     warmup = max(1, int(total_steps * warmup_ratio))
 
     def factor(step: int) -> float:
@@ -53,6 +58,46 @@ def build_scheduler(optimizer: torch.optim.Optimizer, total_steps: int, warmup_r
         return max(0.0, (total_steps - step) / max(1, total_steps - warmup))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
+
+
+def stage_bounds(t) -> list[tuple[str, int, int]]:
+    """(stage, first step, end step) of the freezing stages that occur, in order."""
+    total = t.max_steps
+    cuts = [("heads", int(round(t.head_only_until * total)))]
+    last_end = int(round(t.last_layers_until * total)) if t.last_layers_until else cuts[0][1]
+    cuts.append(("last", last_end))
+    cuts.append(("all", total))
+    bounds, start = [], 0
+    for name, end in cuts:
+        if end > start:
+            bounds.append((name, start, end))
+            start = end
+    return bounds
+
+
+def staged_lr_factor(t):
+    """LambdaLR factor (multiplies train.lr) restarting at every stage: stage lr, warmup over `warmup_ratio` of the
+    stage, then `stage_schedule` decay. The stages match `freeze_stage` (same rounding of the step shares)."""
+    lrs = dict(zip(("heads", "last", "all"), (float(x) for x in t.stage_lrs)))
+    bounds = stage_bounds(t)
+
+    def factor(step: int) -> float:
+        for name, start, end in bounds:
+            if step < end or name == bounds[-1][0]:
+                break
+        length = max(1, end - start)
+        local = min(max(step - start, 0), length - 1)
+        warmup = max(1, int(length * t.warmup_ratio))
+        if local < warmup:
+            shape = (local + 1) / warmup
+        elif t.stage_schedule == "constant":
+            shape = 1.0
+        else:
+            progress = (local - warmup) / max(1, length - warmup)
+            shape = 1.0 - progress if t.stage_schedule == "linear" else 0.5 * (1.0 + math.cos(math.pi * progress))
+        return lrs[name] / t.lr * max(0.0, shape)
+
+    return factor
 
 
 def distill_step(
@@ -153,6 +198,66 @@ def sam_perturb(model: torch.nn.Module, rho: float) -> list[tuple[torch.Tensor, 
     return moved
 
 
+_LAYER_INDEX = re.compile(r"(?:^|\.)layers?\.(\d+)\.")
+
+
+def freeze_stage(t, step: int) -> str:
+    """Jasper-style staged freezing (train.head_only_until / last_layers_until): "heads", "last" or "all"."""
+    for name, start, end in stage_bounds(t):
+        if step < end:
+            return name
+    return "all"
+
+
+def stage_parameters(model: StudentEncoder, stage: str, last_layers: int, final_layers: int = 0) -> Optional[set[int]]:
+    """ids of the parameters trained in a stage (None = all). "last": the heads, the backbone's last `last_layers`
+    layers and its parameters outside the layers and the embeddings (the final norm). "all" with `final_layers` > 0:
+    the same with `final_layers` layers (Jasper's released stage-3 code)."""
+    if stage == "all" and not final_layers:
+        return None
+    if stage == "all":
+        stage, last_layers = "last", final_layers
+    keep = {id(p) for p in model.heads.parameters()}
+    if stage == "heads":
+        return keep
+    named = list(model.backbone.named_parameters())
+    indices = [int(m.group(1)) for n, _ in named if (m := _LAYER_INDEX.search(n))]
+    if not indices:
+        raise ValueError("could not find numbered encoder layers in the backbone's parameter names")
+    first = max(indices) + 1 - last_layers
+    for n, p in named:
+        m = _LAYER_INDEX.search(n)
+        if (m and int(m.group(1)) >= first) or (not m and "embed" not in n):
+            keep.add(id(p))
+    return keep
+
+
+@torch.no_grad()
+def init_reduction_heads(model: StudentEncoder, source: str = "concat") -> list[str]:
+    """Jasper's stage-3 start: every reduction head `<source>_r<dim>` becomes the average of consecutive row groups of
+    the trained full head (Jasper: w.reshape(dim, -1, hidden).mean(1); here np.array_split groups, so the full
+    dimension need not be a multiple of `dim`). Linear heads only."""
+    full = model.heads[source]
+    done = []
+    for name, head in model.heads.items():
+        if not name.startswith(f"{source}_r"):
+            continue
+        groups = np.array_split(np.arange(full.weight.shape[0]), head.weight.shape[0])
+        head.weight.copy_(torch.stack([full.weight[g].mean(dim=0) for g in groups]))
+        head.bias.copy_(torch.stack([full.bias[g].mean() for g in groups]))
+        done.append(name)
+    return done
+
+
+def drop_frozen_grads(model: StudentEncoder, keep: Optional[set[int]]) -> None:
+    """Remove the gradients of the parameters outside `keep`: AdamW then neither updates nor decays them."""
+    if keep is None:
+        return
+    for p in model.parameters():
+        if id(p) not in keep:
+            p.grad = None
+
+
 def pick_teacher(weights: dict[str, float], seed: int, step: int) -> str:
     """train.teacher_sampling "one": the teacher of a step, drawn with probability proportional to its weight."""
     names = [n for n, w in weights.items() if w > 0]
@@ -194,7 +299,8 @@ def run_diagnostics(
     for name in target_chunks:
         target = torch.cat(target_chunks[name])
         proj = torch.cat(proj_chunks[name])
-        metrics[f"teacher_cosine/{name}"] = teacher_cosine(proj, target)
+        if proj.shape[1] == target.shape[1]:  # a reduction head (concat_r<dim>) has no vector target
+            metrics[f"teacher_cosine/{name}"] = teacher_cosine(proj, target)
         metrics[f"geometry_agreement/{name}"] = geometry_agreement(pooled, target)
     if sts_fn is not None:
         try:
@@ -250,8 +356,10 @@ def run_training(
     if len(criterion.log_vars):
         groups.append({"params": list(criterion.log_vars.parameters()), "lr": cfg.loss.uncertainty_lr, "weight_decay": 0.0})
     optimizer = torch.optim.AdamW(groups, lr=t.lr, weight_decay=t.weight_decay)
-    scheduler = build_scheduler(optimizer, t.max_steps, t.warmup_ratio)
+    scheduler = build_scheduler(optimizer, t.max_steps, t.warmup_ratio, t)
     averagers = make_averagers(t)
+    # fusion.reduce_dims: the step at which the reduction heads (concat_r<dim>) are switched on and initialised
+    reduction_starts = {tc.ramp_start_step for tc in cfg.teachers if tc.name.startswith("concat_r")}
 
     step = 0
     if resume:
@@ -399,6 +507,9 @@ def run_training(
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             targets = {k: v.to(device) for k, v in batch["targets"].items()}
+            if step in reduction_starts:
+                names = init_reduction_heads(model)
+                print(f"step {step}: reduction heads {names} initialised from the concat head", flush=True)
             optimizer.zero_grad(set_to_none=True)
             criterion.set_step(step)  # `step` steps are done, this is step number `step` (teacher weights may ramp)
             if t.teacher_sampling == "one":
@@ -435,6 +546,10 @@ def run_training(
                 for k, v in joint.step(model, step, device).items():
                     joint_window[k] = joint_window.get(k, 0.0) + v
                 joint_count += 1
+            stage = freeze_stage(t, step)
+            if stage != "all" or t.final_stage_layers:
+                drop_frozen_grads(model, stage_parameters(model, stage, t.last_layers, t.final_stage_layers))
+                logs["frozen_stage"] = {"heads": 0.0, "last": 1.0, "all": 2.0}[stage]
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), t.grad_clip)
             optimizer.step()
             scheduler.step()
@@ -494,6 +609,27 @@ def apply_target_methods(cfg: ExperimentConfig, caches: dict[str, Any]) -> tuple
     Returns the config the training loop should use (with fusion the only teacher is the fused one) and the
     matching caches. Without either option both are returned unchanged.
     """
+    if cfg.fusion.mode == "concat":
+        weights = {t.name: teacher_weight(t, 0) for t in cfg.teachers}
+        inner = {t.name: (CenteredCache(caches[t.name]) if t.center else caches[t.name]) for t in cfg.teachers}
+        concat = ConcatCache(inner, weights)
+        print(f"concat target (Jasper-style): {concat.names}, scales {concat.scales}, dim {concat.dim}", flush=True)
+        teachers = [TeacherConfig(name="concat", hf_id="fusion:concat", dim=concat.dim, weight=1.0)]
+        out = {"concat": concat}
+        fz = cfg.fusion
+        if fz.reduce_dims:
+            share = cfg.train.last_layers_until if fz.reduce_from < 0 else fz.reduce_from
+            start = int(round(share * cfg.train.max_steps))
+            for d in fz.reduce_dims:
+                # Jasper's FC2-FC4: same target, relation terms only, switched on at `start` (a step in the weight)
+                teachers.append(TeacherConfig(
+                    name=f"concat_r{int(d)}", hf_id="fusion:concat", dim=int(d), weight=float(fz.reduce_weight),
+                    weight_start=0.0 if start > 0 else None, ramp_start_step=start, ramp_end_step=start,
+                    loss_weights={"cosine": 0.0},
+                ))
+                out[f"concat_r{int(d)}"] = concat
+            print(f"reduction heads {list(fz.reduce_dims)} from step {start}", flush=True)
+        return dataclasses.replace(cfg, teachers=teachers), out
     if cfg.fusion.mode != "none":
         weights = {t.name: teacher_weight(t, 0) for t in cfg.teachers}
         fused, report = fuse_teachers(

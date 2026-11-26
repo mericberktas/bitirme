@@ -104,7 +104,15 @@ def ranking_hinge(
     num_samples: int,
     generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
-    """Pair-of-pairs hinge on similarity vectors (one entry per text pair); only the teacher's order is used."""
+    """Pair-of-pairs hinge on similarity vectors (one entry per text pair); only the teacher's order is used.
+
+    `num_samples` 0: every pair of pairs once, as Jasper's code does (get_score_diff over the upper triangle; ties in
+    the teacher count as "b first"; mean over all of them); otherwise `num_samples` random pairs of pairs."""
+    if num_samples == 0:
+        s_diff = student_pairs[None, :] - student_pairs[:, None]  # [a, b] = s_b - s_a
+        label = torch.where(teacher_pairs[None, :] - teacher_pairs[:, None] < 0, 1.0, -1.0)
+        upper = torch.triu(torch.ones_like(s_diff, dtype=torch.bool), diagonal=1)
+        return F.relu(s_diff * label + margin)[upper].mean()
     num_pairs = student_pairs.shape[0]
     a = torch.randint(0, num_pairs, (num_samples,), device=student_pairs.device, generator=generator)
     b = torch.randint(0, num_pairs, (num_samples,), device=student_pairs.device, generator=generator)
@@ -354,9 +362,12 @@ class MultiTeacherLoss(nn.Module):
                 mixture = probs if mixture is None else mixture + probs
                 mixture_weight += share
             parts = pooled.new_zeros((), dtype=torch.float32)
+            rel_parts = pooled.new_zeros((), dtype=torch.float32)  # sim + resim (averaged over heads with "jasper")
             if name in cos_ps:
                 c = cos_ps[name].mean()
                 weighted = (sample_w[name] * cos_ps[name]).mean() if name in sample_w else c
+                if cfg.cosine_reduction == "sum":  # Jasper's formula: sum over the texts of 1 - cos
+                    weighted = weighted * cos_ps[name].shape[0]
                 parts = parts + self._uw(name, "cosine", cfg.cosine_weight * scale["cosine"] * weighted, logs)
                 logs[f"cos/{name}"] = float(c.detach())
             if self.uses_bank():
@@ -377,26 +388,34 @@ class MultiTeacherLoss(nn.Module):
                 z = zscore(offdiag_similarities(target))
                 shared_gram = (weight / weight_sum) * z if shared_gram is None else shared_gram + (weight / weight_sum) * z
             else:
+                rel = projections[name] if cfg.relation_on == "head" else pooled
                 if cfg.sim_weight and scale["sim"] > 0:
                     s = similarity_loss(
-                        pooled, target, cfg.gram_standardize, cfg.gram_target_mean, cfg.gram_target_std,
+                        rel, target, cfg.gram_standardize, cfg.gram_target_mean, cfg.gram_target_std,
                         cfg.sim_row_centered,
                     )
-                    parts = parts + self._uw(name, "sim", cfg.sim_weight * scale["sim"] * s, logs)
+                    rel_parts = rel_parts + self._uw(name, "sim", cfg.sim_weight * scale["sim"] * s, logs)
                     logs[f"sim/{name}"] = float(s.detach())
                 if cfg.resim_weight and scale["resim"] > 0:
                     r = relative_similarity_loss(
-                        pooled,
+                        rel,
                         target,
                         cfg.resim_margin,
                         cfg.resim_num_samples,
                         self._generator(pooled.device),
                     )
-                    parts = parts + self._uw(name, "resim", cfg.resim_weight * scale["resim"] * r, logs)
+                    rel_parts = rel_parts + self._uw(name, "resim", cfg.resim_weight * scale["resim"] * r, logs)
                     logs[f"resim/{name}"] = float(r.detach())
-            total = total + (weight / weight_sum) * parts
+            if cfg.teacher_combine == "jasper":
+                # Jasper's stage-3 code: cosine of the full head + the MEAN over the active heads of sim and rank
+                parts = parts + rel_parts / max(1, sum(1 for w in weights.values() if w > 0))
+                share = weight
+            else:
+                parts = parts + rel_parts
+                share = weight if cfg.teacher_combine == "sum" else weight / weight_sum
+            total = total + share * parts
             if parts_out is not None:
-                parts_out[name] = (weight / weight_sum) * parts
+                parts_out[name] = share * parts
         if shared and shared_gram is not None:
             student_pairs = offdiag_similarities(pooled)
             # averaging disagreeing teachers shrinks the spread: re-standardise, then give it the reference geometry

@@ -75,9 +75,12 @@ LATE_DEFAULTS = {
     "train": {
         "ema_decay": 0.0, "swa_start": 0.0, "swa_every": 200, "sampling": "uniform", "sample_scores": None,
         "keep_fraction": 0.7, "sampling_power": 1.0, "short_max_length": 0, "short_until": 0.5, "sam_rho": 0.0,
-        "teacher_sampling": "all",
+        "teacher_sampling": "all", "head_only_until": 0.0, "last_layers_until": 0.0, "last_layers": 3,
+        "stage_lrs": None, "stage_schedule": "linear", "final_stage_layers": 0,
     },
-    "loss": {"uncertainty_weighting": False, "uncertainty_lr": 0.01},
+    "loss": {"uncertainty_weighting": False, "uncertainty_lr": 0.01, "relation_on": "pooled", "cosine_reduction": "mean",
+             "teacher_combine": "weighted_mean"},
+    "fusion": {"reduce_dims": [], "reduce_from": -1.0, "reduce_weight": 1.0},
 }
 SAMPLING_MODES = ("uniform", "prune_easy", "prune_hard", "weighted")
 BANK_FIELDS = ("bank_size", "bank_refresh_every", "bank_kl_weight", "bank_temperature", "bank_student_temperature",
@@ -152,6 +155,18 @@ class LossConfig:
     # feeds the similarity and ranking terms once (re-scaled to the reference mean/std above, the student stays in
     # raw cosine units); the vector term stays per teacher. Shared always standardises.
     relation_mode: str = "per_teacher"
+    # Which student vectors the relation terms (similarity, ranking) compare. "pooled" (our recipe): the pooled
+    # backbone embedding, the vector used at inference; the heads only serve the vector term. "head": every teacher's
+    # relation terms use that teacher's head output, as Jasper (Zhang et al. 2024) does with its single FC1 layer on
+    # the concatenated target (`fusion.mode: concat`); the pooled vector is then shaped only through the heads.
+    relation_on: str = "pooled"
+    # Reduction of the vector (cosine) term over the batch: "mean" (our recipe; the weights 10/200/20 were set with it)
+    # or "sum" (as Jasper's formula is written: sum over the texts of 1 - cos).
+    cosine_reduction: str = "mean"
+    # How the teachers' (heads') loss parts are combined: "weighted_mean" (our recipe: sum of weight * part / sum of
+    # weights), "sum" (sum of weight * part) or "jasper" (Jasper's stage-3 code: sum of weight * vector term, plus
+    # the similarity and ranking terms of the heads with positive weight averaged over those heads).
+    teacher_combine: str = "weighted_mean"
     # Listwise term (any relation_mode, 0 = off): for every text of the batch, the softmax (temperature
     # `listwise_temperature`) of its cosines to the other texts is its neighbour distribution; the student's must cover
     # the MIXTURE of the teachers' distributions (teacher weights as mixture weights; each teacher's cosines are
@@ -204,6 +219,9 @@ class LossConfig:
 
 @dataclass
 class FusionConfig:
+    # Jasper-style target (Zhang et al. 2024), "concat": every teacher vector is normalised, scaled by the square root
+    # of its weight share, concatenated and normalised again (dim = sum of the teacher dims; reference/dim/fit_samples
+    # unused). Its Gram matrix is the weight-averaged Gram of the teachers. One head, one "teacher" called "concat".
     # Method (d), shared vector space: "aligned_mean" reduces every teacher to `dim` PCA components, rotates each
     # onto the `reference` teacher's space with an orthogonal Procrustes fit on `fit_samples` texts, and averages
     # the aligned unit vectors with the teacher weights into one fused target. The student then has a single head
@@ -213,6 +231,13 @@ class FusionConfig:
     dim: int = 512
     fit_samples: int = 20_000
     seed: int = 0
+    # Jasper's stage 3 (concat only): extra heads mapping the pooled student vector to each of `reduce_dims`, trained
+    # with the similarity and ranking terms only (no vector term: the dimensions differ) against the concat target,
+    # from `reduce_from` (share of max_steps; -1 = from train.last_layers_until, Jasper's stage 3) with weight
+    # `reduce_weight`. They are extra "teachers" named concat_r<dim> on the same target; export one with export_head.
+    reduce_dims: list = field(default_factory=list)
+    reduce_from: float = -1.0
+    reduce_weight: float = 1.0
 
 
 @dataclass
@@ -286,6 +311,22 @@ class TrainConfig:
     # Sharpness-aware minimisation (SAM, Foret et al. 2021; 0 = off): the gradient is taken at the weights moved by
     # `sam_rho` along the normalised gradient, then applied at the original weights. Twice the compute per step.
     sam_rho: float = 0.0
+    # Staged freezing as in Jasper's stages 1-2 (shares of max_steps; 0 = off): until `head_only_until` only the
+    # projection heads are trained, until `last_layers_until` the heads and the last `last_layers` encoder layers (and
+    # the final norm), afterwards everything. The frozen parameters' gradients are dropped before the optimiser step
+    # (no update, no weight decay); the learning-rate schedule is the usual single one.
+    head_only_until: float = 0.0
+    last_layers_until: float = 0.0
+    last_layers: int = 3
+    # Learning rate per freezing stage, restarted at every stage boundary (Jasper: 1e-4 / 8e-5 / 7e-5 for its stages
+    # 1 / 2 / 3), as [head-only, last-layers, all]; entries of stages that do not occur are ignored. None = the usual
+    # single schedule over all steps. Within a stage: warmup over `warmup_ratio` of the stage, then `stage_schedule`
+    # ("linear" decay to 0, "cosine" decay to 0, or "constant").
+    stage_lrs: Optional[list] = None
+    # Encoder layers trained in the last stage (with the final norm, without embeddings); 0 = all parameters. The
+    # paper says all; Jasper's released stage-3 code trains the last 3 layers and the final norm only.
+    final_stage_layers: int = 0
+    stage_schedule: str = "linear"
     # "all": every teacher in every step (default). "one": one teacher per step, drawn with probability proportional to
     # the teacher weights (deterministic in seed and step); the others sit the step out.
     teacher_sampling: str = "all"
@@ -471,6 +512,36 @@ def validate(cfg: ExperimentConfig) -> None:
             raise ValueError("train.short_max_length must be in (0, student.max_length) and train.short_until in (0, 1)")
     if tr.sam_rho < 0:
         raise ValueError("train.sam_rho must be >= 0")
+    if not 0.0 <= tr.head_only_until < 1.0 or not 0.0 <= tr.last_layers_until < 1.0 or tr.last_layers < 1:
+        raise ValueError("train.head_only_until and train.last_layers_until must be in [0, 1), train.last_layers >= 1")
+    if tr.last_layers_until and tr.last_layers_until < tr.head_only_until:
+        raise ValueError("train.last_layers_until must be 0 (off) or >= train.head_only_until")
+    if lo.cosine_reduction not in ("mean", "sum") or lo.teacher_combine not in ("weighted_mean", "sum", "jasper"):
+        raise ValueError("loss.cosine_reduction: 'mean' or 'sum'; loss.teacher_combine: 'weighted_mean', 'sum' or 'jasper'")
+    if lo.resim_num_samples < 0:
+        raise ValueError("loss.resim_num_samples must be >= 0 (0 = every pair of pairs, as in Jasper's code)")
+    if tr.stage_lrs is not None:
+        if not tr.head_only_until and not tr.last_layers_until:
+            raise ValueError("train.stage_lrs needs freezing stages (train.head_only_until / last_layers_until)")
+        if len(tr.stage_lrs) != 3 or any(float(x) <= 0 for x in tr.stage_lrs):
+            raise ValueError("train.stage_lrs must list 3 positive learning rates: [head-only, last-layers, all]")
+    if tr.final_stage_layers < 0:
+        raise ValueError("train.final_stage_layers must be >= 0 (0 = all parameters)")
+    if tr.stage_schedule not in ("linear", "cosine", "constant"):
+        raise ValueError(f"train.stage_schedule must be linear, cosine or constant, got {tr.stage_schedule!r}")
+    fz = cfg.fusion
+    if fz.reduce_dims:
+        if fz.mode != "concat" or lo.relation_on != "head":
+            raise ValueError("fusion.reduce_dims needs fusion.mode concat and loss.relation_on head")
+        if any(int(d) < 2 for d in fz.reduce_dims) or fz.reduce_weight <= 0:
+            raise ValueError("fusion.reduce_dims must be >= 2 and fusion.reduce_weight positive")
+        start = tr.last_layers_until if fz.reduce_from < 0 else fz.reduce_from
+        if not 0.0 <= start < 1.0:
+            raise ValueError("fusion.reduce_from must be -1 (= train.last_layers_until) or in [0, 1)")
+    if lo.relation_on not in ("pooled", "head"):
+        raise ValueError(f"loss.relation_on must be 'pooled' or 'head', got {lo.relation_on!r}")
+    if lo.relation_on == "head" and (lo.relation_mode == "shared" or lo.listwise_weight or lo.gor_weight):
+        raise ValueError("loss.relation_on 'head' supports only relation_mode 'per_teacher' without listwise/gor terms")
     if tr.teacher_sampling not in ("all", "one"):
         raise ValueError(f"train.teacher_sampling must be 'all' or 'one', got {tr.teacher_sampling!r}")
     if tr.teacher_sampling == "one" and (len(cfg.teachers) < 2 or cfg.fusion.mode != "none"):
@@ -574,9 +645,16 @@ def validate(cfg: ExperimentConfig) -> None:
     if cfg.train.grad_projection not in ("none", "pcgrad"):
         raise ValueError(f"train.grad_projection must be 'none' or 'pcgrad', got {cfg.train.grad_projection!r}")
     fusion = cfg.fusion
-    if fusion.mode not in ("none", "aligned_mean"):
-        raise ValueError(f"fusion.mode must be 'none' or 'aligned_mean', got {fusion.mode!r}")
-    if fusion.mode != "none":
+    if fusion.mode not in ("none", "aligned_mean", "concat"):
+        raise ValueError(f"fusion.mode must be 'none', 'aligned_mean' or 'concat', got {fusion.mode!r}")
+    if fusion.mode == "concat":
+        if len(cfg.teachers) < 2:
+            raise ValueError("fusion concat needs at least two teachers")
+        if any(t.weight_start is not None for t in cfg.teachers):
+            raise ValueError("fusion uses static teacher weights: remove weight_start/ramp settings")
+        if any(t.pca_dim is not None for t in cfg.teachers):
+            raise ValueError("fusion concat does not combine with teachers[].pca_dim")
+    elif fusion.mode != "none":
         if len(cfg.teachers) < 2:
             raise ValueError("fusion needs at least two teachers")
         if fusion.reference not in names:

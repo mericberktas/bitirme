@@ -58,12 +58,14 @@ def mean_pairwise_cosine(x: np.ndarray, max_n: int = 2000, seed: int = 0) -> flo
 
 
 def append_linear_head(st_model, w: np.ndarray, b: np.ndarray, normalize: bool):
-    """New SentenceTransformer = the model's modules + Dense(identity activation) holding (w, b) [+ Normalize]."""
+    """New SentenceTransformer = the model's modules + Dense(identity activation) holding (w, b) [+ Normalize].
+
+    `w` is (out, in); out may differ from in (a teacher head, export_head.py)."""
     import torch
     from sentence_transformers import SentenceTransformer, models
 
-    d = w.shape[0]
-    dense = models.Dense(d, d, bias=True, activation_function=torch.nn.Identity())
+    d_out, d_in = w.shape
+    dense = models.Dense(d_in, d_out, bias=True, activation_function=torch.nn.Identity())
     with torch.no_grad():
         dense.linear.weight.copy_(torch.tensor(w, dtype=dense.linear.weight.dtype))
         dense.linear.bias.copy_(torch.tensor(b, dtype=dense.linear.bias.dtype))

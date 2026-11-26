@@ -153,6 +153,41 @@ class ArrayCache:
         return self.vectors[np.asarray(indices, dtype=np.int64)].astype(np.float32)
 
 
+class ConcatCache:
+    """Jasper-style target: every teacher's vector normalised, scaled by sqrt(weight share), concatenated, normalised.
+
+    The blocks of a unit-norm teacher vector scaled by sqrt(w_t) have total norm 1, so the concatenation is unit length
+    already and the dot product of two targets is sum_t w_t cos_t: the target's Gram matrix is the weight-averaged Gram
+    of the teachers (equal weights: the mean, as in Jasper with two teachers). Read lazily from the teacher caches.
+    """
+
+    def __init__(self, caches: dict, weights: dict[str, float]):
+        names = [n for n in caches if weights.get(n, 0.0) > 0]
+        if len(names) < 2:
+            raise ValueError("concat needs at least two teachers with positive weight")
+        total = sum(weights[n] for n in names)
+        self.names = names
+        self.caches = caches
+        self.scales = {n: float(np.sqrt(weights[n] / total)) for n in names}
+        lengths = {len(caches[n]) for n in names}
+        if len(lengths) != 1:
+            raise ValueError(f"teacher caches have different lengths: {lengths}")
+        self.n_texts = lengths.pop()
+        self.dim = sum(int(caches[n].get([0]).shape[1]) for n in names)
+
+    def __len__(self) -> int:
+        return self.n_texts
+
+    def get(self, indices) -> np.ndarray:
+        blocks = []
+        for n in self.names:
+            v = np.asarray(self.caches[n].get(indices), dtype=np.float32)
+            v = v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)
+            blocks.append(v * self.scales[n])
+        out = np.concatenate(blocks, axis=1)
+        return out / np.maximum(np.linalg.norm(out, axis=1, keepdims=True), 1e-12)
+
+
 def _pca_basis(x: np.ndarray, dim: int) -> tuple[np.ndarray, np.ndarray, float]:
     """Mean, the top `dim` principal directions (d x dim) and the share of variance they keep."""
     mean = x.mean(axis=0)
