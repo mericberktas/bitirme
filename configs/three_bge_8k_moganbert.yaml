@@ -1,0 +1,83 @@
+# MoganBERT pilot, geometry screen (and a possible three-teacher run): BGE-M3 + plain 8K-embed + MoganBERT-Embed,
+# equal weights, same recipe as the pair (200K mix, lr 1e-4, 5400 steps). Used first by teacher_compare to put the
+# three teachers side by side (Gram Pearson, top-10 neighbour overlap, PCs for 90% variance); 8K-embed and
+# MoganBERT-Embed are both Qwen3-8B-distilled 768-d ModernBERT-base models with different bases and tokenizers.
+#   teachers.0 = bge_m3     teachers.1 = modernbert_tr_embed     teachers.2 = moganbert_embed
+
+name: three_bge_8k_moganbert
+output_dir: /content/drive/MyDrive/bitirme/runs
+local_tmp_dir: /content/ckpt_staging
+tensorboard: true
+
+teachers:
+  - name: bge_m3
+    hf_id: BAAI/bge-m3
+    revision: 5617a9f61b028005a4858fdac845db406aefb181
+    dim: 1024
+    doc_prefix: ""
+    max_length: 512
+    batch_size: 64
+    dtype: float16
+    weight: 1.0
+  - name: modernbert_tr_embed
+    hf_id: ytu-ce-cosmos/modernbert-tr-embed
+    revision: 855820e0079102805908d60d32cd9fd59c970b80
+    dim: 768
+    doc_prefix: ""
+    max_length: 512
+    batch_size: 64
+    dtype: float32
+    weight: 1.0
+  - name: moganbert_embed
+    hf_id: moganai/MoganBERT-Embed
+    revision: c9356e2694ffc15f5cc22f186d4d4a84ebcf2330
+    dim: 768
+    doc_prefix: ""
+    max_length: 512
+    batch_size: 64
+    dtype: float32
+    weight: 1.0
+
+student:
+  hf_id: ytu-ce-cosmos/modernbert-tr-base-1k
+  revision: c2e35f553101cce5b03fbb318ef8728473fd34dd
+  max_length: 512
+  pooling: mean
+
+data:
+  corpus_path: /content/drive/MyDrive/bitirme/data/mix/mix_v2_200k.jsonl
+  text_column: text
+  cache_dir: /content/drive/MyDrive/bitirme/cache/teachers
+  shard_size: 10000
+  max_samples: null
+  min_chars: 10
+  val_size: 2000
+
+loss:
+  cosine_weight: 10.0
+  sim_weight: 200.0
+  resim_weight: 20.0
+  resim_margin: 0.015
+  resim_num_samples: 4096
+  gor_weight: 0.0
+
+train:
+  batch_size: 128
+  chunk_size: 32             # gradient caching: same maths, memory of 32 texts (null ran out of memory on an L4)
+  lr: 1.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_steps: 5400
+  grad_clip: 1.0
+  bf16: true
+  seed: 42
+  num_workers: 2
+  log_every: 25
+  diag_every: 300
+  ckpt_every: 300
+  keep_last: 2
+
+eval:
+  sts_dataset: null
+  pairs_val: /content/drive/MyDrive/bitirme/data/stage1/pairs_val.jsonl
+  query_max_length: 64

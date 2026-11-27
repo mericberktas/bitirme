@@ -1,0 +1,68 @@
+# MoganBERT pilot, single teacher: MoganBERT-Embed (moganai, 149M, 768-d, mean pooling + Normalize, no prompt) in
+# place of 8K-embed, same recipe as the plain pair (200K mix, lr 1e-4, 5400 steps). Question: is 8K-embed easy to
+# transfer because it is a small Qwen-distilled 768-d model, or because of its lineage (same tokenizer and lab as the
+# student)? MoganBERT-Embed has the same architecture (ModernBERT-base: 22 layers, 768, 8192 context, RoPE 160K/10K)
+# and the same kind of recipe (Qwen3-Embedding-8B distillation + contrastive fine-tuning + checkpoint average), but
+# its own from-scratch base MoganBERT-TR and its own Unigram tokenizer (50,048 tokens; 4,029 shared with the student's
+# 50,008, while 8K-embed's vocabulary is identical to the student's). Reference: 8K-embed alone at lr 1e-4 65.67,
+# BGE-M3 alone 66.07.
+
+name: single_moganbert
+output_dir: /content/drive/MyDrive/bitirme/runs
+local_tmp_dir: /content/ckpt_staging
+tensorboard: true
+
+teachers:
+  - name: moganbert_embed
+    hf_id: moganai/MoganBERT-Embed
+    revision: c9356e2694ffc15f5cc22f186d4d4a84ebcf2330
+    dim: 768
+    doc_prefix: ""
+    max_length: 512
+    batch_size: 64
+    dtype: float32
+    weight: 1.0
+
+student:
+  hf_id: ytu-ce-cosmos/modernbert-tr-base-1k
+  revision: c2e35f553101cce5b03fbb318ef8728473fd34dd
+  max_length: 512
+  pooling: mean
+
+data:
+  corpus_path: /content/drive/MyDrive/bitirme/data/mix/mix_v2_200k.jsonl
+  text_column: text
+  cache_dir: /content/drive/MyDrive/bitirme/cache/teachers
+  shard_size: 10000
+  max_samples: null
+  min_chars: 10
+  val_size: 2000
+
+loss:
+  cosine_weight: 10.0
+  sim_weight: 200.0
+  resim_weight: 20.0
+  resim_margin: 0.015
+  resim_num_samples: 4096
+  gor_weight: 0.0
+
+train:
+  batch_size: 128
+  chunk_size: 32             # gradient caching: same maths, memory of 32 texts (null ran out of memory on an L4)
+  lr: 1.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_steps: 5400
+  grad_clip: 1.0
+  bf16: true
+  seed: 42
+  num_workers: 2
+  log_every: 25
+  diag_every: 300
+  ckpt_every: 300
+  keep_last: 2
+
+eval:
+  sts_dataset: null
+  pairs_val: /content/drive/MyDrive/bitirme/data/stage1/pairs_val.jsonl
+  query_max_length: 64
