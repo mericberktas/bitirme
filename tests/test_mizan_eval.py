@@ -85,3 +85,28 @@ def test_torchvision_placeholder_for_datasets():
     assert mizan.patch_torchvision_for_datasets(io) is False  # not replaced a second time
     existing = SimpleNamespace(VideoReader=int)
     assert mizan.patch_torchvision_for_datasets(existing) is False and existing.VideoReader is int
+
+
+def test_paper_protocol_reproduces_the_aggregates_of_the_advisors_paper():
+    # Yuce et al. 2027, Tables 15-17, Vanilla + 50 GB + 1GB-Instruct: retrieval 73.87, classification 72.65,
+    # family-macro 73.26, task-macro 73.02
+    values = dict(zip(mizan.PAPER_RETRIEVAL + mizan.PAPER_CLASSIFICATION,
+                      [96.65, 59.25, 65.70, 67.45, 73.29, 80.90, 77.35, 63.99, 80.30, 65.26]))
+    s = mizan.summarize_paper_scores({t: {"score": v, "split": "test", "file": "x"} for t, v in values.items()})
+    assert s["retrieval_avg"] == pytest.approx(73.87, abs=0.005) and s["classification_avg"] == pytest.approx(72.65, abs=0.006)
+    assert s["family_macro"] == pytest.approx(73.26, abs=0.006) and s["task_macro"] == pytest.approx(73.01, abs=0.006)
+    partial = mizan.summarize_paper_scores({"XQuADRetrieval": {"score": 90.0, "split": "test", "file": "x"}})
+    assert partial["task_macro"] is None and "TurkishConstitutionalCourtViolation" in partial["missing_tasks"]
+    assert set(mizan.PAPER_RETRIEVAL + mizan.PAPER_CLASSIFICATION) - set(mizan.TASK_CATEGORIES) == set(mizan.EXTRA_TASKS)
+
+
+def test_extra_task_is_accepted_by_name_and_builds_with_mteb_138(tmp_path):
+    with pytest.raises(ValueError, match="unknown extra task"):
+        mizan.extra_task("Nope")
+    with pytest.raises(ValueError, match="dtype"):  # the court task passes the task-name check
+        mizan.run_evaluation("some/model", tmp_path, task_names=["TurkishConstitutionalCourtViolation"], dtype="int8")
+    mteb = pytest.importorskip("mteb")
+    if not str(mteb.__version__).startswith("1.38"):
+        pytest.skip("the extra task is written for mteb 1.38")
+    task = mizan.extra_task("TurkishConstitutionalCourtViolation")
+    assert task.metadata.name == "TurkishConstitutionalCourtViolation" and task.metadata.main_score == "accuracy"

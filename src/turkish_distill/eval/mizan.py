@@ -58,6 +58,19 @@ SHARED_WITH_TRMTEB = [
 # The development set. XNLIV2 re-translates the XNLI pairs, so it is only partly independent of TR-MTEB's XNLI.
 INDEPENDENT_TASKS = [t for t in TASK_CATEGORIES if t not in SHARED_WITH_TRMTEB]
 CATEGORY_ORDER = ["Classification", "Retrieval", "PairClassification", "Clustering", "STS"]
+
+# Tasks that are not on Mizan but can be run with the same mteb 1.38 setup (defined here, see `extra_task`).
+# TurkishConstitutionalCourtViolation exists only in mteb 2.x; the advisor's paper (Yuce et al., Information Sciences
+# 767, 2027) uses it. Its data (KocLab-Bilkent, cleaned copy pinned like mteb 2 pins it) has "text"/"label" columns.
+EXTRA_TASKS: dict[str, str] = {"TurkishConstitutionalCourtViolation": "Classification"}
+# The ten tasks of that paper (3 retrieval, nDCG@10; 7 classification, accuracy) and its aggregates: retrieval and
+# classification averages, "family-macro" = mean of the two, "task-macro" = mean over the ten tasks.
+PAPER_RETRIEVAL = ["XQuADRetrieval", "TurHistQuadRetrieval", "WebFAQRetrieval"]
+PAPER_CLASSIFICATION = [
+    "MassiveIntentClassification", "MassiveScenarioClassification", "MultilingualSentimentClassification",
+    "SIB200Classification", "TurkishConstitutionalCourtViolation", "TurkishMovieSentimentClassification",
+    "TurkishProductSentimentClassification",
+]
 _RUN_PROTOCOL = ("model", "revision", "dtype", "max_seq_length", "prompts", "normalize")
 
 
@@ -166,6 +179,64 @@ def summarize_scores(task_scores: dict[str, dict]) -> dict:
     }
 
 
+def summarize_paper_scores(task_scores: dict[str, dict]) -> dict:
+    """The advisor's paper protocol: retrieval / classification averages, family-macro and task-macro (None while a
+    task is missing). CourtViolation is scored with accuracy, as the paper reports (mteb 2 uses F1 as main score)."""
+    known = {t: v["score"] for t, v in task_scores.items() if t in PAPER_RETRIEVAL + PAPER_CLASSIFICATION}
+    retr = [known[t] for t in PAPER_RETRIEVAL if t in known]
+    clf = [known[t] for t in PAPER_CLASSIFICATION if t in known]
+    r = _mean(retr) if len(retr) == len(PAPER_RETRIEVAL) else None
+    c = _mean(clf) if len(clf) == len(PAPER_CLASSIFICATION) else None
+    complete = r is not None and c is not None
+    return {
+        "retrieval_avg": r,
+        "classification_avg": c,
+        "family_macro": (r + c) / 2 if complete else None,
+        "task_macro": _mean(retr + clf) if complete else None,
+        "missing_tasks": sorted(set(PAPER_RETRIEVAL + PAPER_CLASSIFICATION) - set(known)),
+        "per_task": {t: known[t] for t in PAPER_RETRIEVAL + PAPER_CLASSIFICATION if t in known},
+    }
+
+
+def summarize_paper_dir(results_dir: str | Path) -> dict:
+    return summarize_paper_scores(collect_task_scores(results_dir))
+
+
+def extra_task(name: str):
+    """An mteb 1.38 task object for a name of EXTRA_TASKS."""
+    if name != "TurkishConstitutionalCourtViolation":
+        raise ValueError(f"unknown extra task {name!r}; known: {sorted(EXTRA_TASKS)}")
+    from mteb.abstasks.AbsTaskClassification import AbsTaskClassification
+    from mteb.abstasks.TaskMetadata import TaskMetadata
+
+    class TurkishConstitutionalCourtViolation(AbsTaskClassification):
+        metadata = TaskMetadata(
+            name="TurkishConstitutionalCourtViolation",
+            description="Binary classification of Turkish constitutional court decisions: violation vs no violation.",
+            reference="https://huggingface.co/datasets/KocLab-Bilkent/turkish-constitutional-court",
+            dataset={
+                "path": "denizgulal/turkish-constitutional-court-violation-clean",
+                "revision": "333f49b7ddc72fa4a86ec5bd756a28c585311c74",
+            },
+            type="Classification",
+            category="p2p",
+            modalities=["text"],
+            eval_splits=["test"],
+            eval_langs=["tur-Latn"],
+            main_score="accuracy",
+            date=("2000-01-01", "2023-02-20"),
+            domains=["Legal", "Non-fiction"],
+            task_subtypes=["Political classification"],
+            license="cc-by-4.0",
+            annotations_creators="human-annotated",
+            dialect=[],
+            sample_creation="found",
+            bibtex_citation="",
+        )
+
+    return TurkishConstitutionalCourtViolation()
+
+
 def summarize_dir(results_dir: str | Path) -> dict:
     return summarize_scores(collect_task_scores(results_dir))
 
@@ -234,11 +305,12 @@ def run_evaluation(
     verbosity: int = 1,
     normalize: bool = False,
 ) -> Path:
-    """Evaluate one model on the Mizan Turkish tasks (all 14, or `task_names`). Plain encoding, no prompts.
+    """Evaluate one model on the Mizan Turkish tasks (all 14, or `task_names`, which may also name EXTRA_TASKS).
+    Plain encoding, no prompts.
 
     `model` is a Hugging Face id or a local path (e.g. a trained student's `final/` directory)."""
     if task_names:
-        unknown = sorted(set(task_names) - set(TASK_CATEGORIES))
+        unknown = sorted(set(task_names) - set(TASK_CATEGORIES) - set(EXTRA_TASKS))
         if unknown:
             raise ValueError(f"unknown Mizan tasks {unknown}; valid names: {sorted(TASK_CATEGORIES)}")
     dtypes = ("float32", "float16", "bfloat16")
@@ -290,7 +362,9 @@ def run_evaluation(
                 st_model.append(Normalize())
         st_model.prompts = {}
         st_model.default_prompt_name = None
-        tasks = mteb.get_tasks(tasks=todo, languages=["tur"])
+        regular = [t for t in todo if t not in EXTRA_TASKS]
+        tasks = list(mteb.get_tasks(tasks=regular, languages=["tur"])) if regular else []
+        tasks += [extra_task(t) for t in todo if t in EXTRA_TASKS]
         try:
             run_with_write_retries(
                 lambda: MTEB(tasks=tasks).run(
